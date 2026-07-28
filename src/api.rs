@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    config::AppConfig,
+    config::{AppConfig, SUPPORTED_OPENAI_MODELS},
     event::ApiEvent,
     model::{RequestMessage, TokenUsage},
     proxy,
@@ -38,9 +38,75 @@ pub struct ApiRequest {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [RequestMessage],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    stream: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModelApiProfile {
+    reasoning: bool,
+    modern_token_limit: bool,
+}
+
+impl ModelApiProfile {
+    fn for_model(model: &str) -> Self {
+        let reasoning = is_reasoning_model(model);
+        let modern_token_limit = reasoning
+            || SUPPORTED_OPENAI_MODELS.iter().any(|alias| {
+                model == *alias
+                    || model
+                        .strip_prefix(alias)
+                        .is_some_and(|suffix| suffix.starts_with("-20"))
+            });
+        Self {
+            reasoning,
+            modern_token_limit,
+        }
+    }
+}
+
+fn is_reasoning_model(model: &str) -> bool {
+    model == "gpt-5"
+        || model.starts_with("gpt-5-")
+        || model.starts_with("gpt-5.")
+        || ["o1", "o3", "o4"]
+            .iter()
+            .any(|family| model == *family || model.starts_with(&format!("{family}-")))
+}
+
+fn adapt_messages(messages: &[RequestMessage], profile: ModelApiProfile) -> Vec<RequestMessage> {
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            if profile.reasoning && message.role == "system" {
+                message.role = "developer";
+            }
+            message
+        })
+        .collect()
+}
+
+fn chat_request<'a>(
+    model: &'a str,
+    messages: &'a [RequestMessage],
     temperature: f32,
     max_tokens: u32,
-    stream: bool,
+) -> ChatRequest<'a> {
+    let profile = ModelApiProfile::for_model(model);
+    ChatRequest {
+        model,
+        messages,
+        temperature: (!profile.reasoning).then_some(temperature),
+        max_tokens: (!profile.modern_token_limit).then_some(max_tokens),
+        max_completion_tokens: profile.modern_token_limit.then_some(max_tokens),
+        stream: true,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -197,13 +263,9 @@ impl ApiClient {
             return;
         }
 
-        let body = ChatRequest {
-            model: &request.model,
-            messages: &request.messages,
-            temperature: self.temperature,
-            max_tokens: self.max_tokens,
-            stream: true,
-        };
+        let profile = ModelApiProfile::for_model(&request.model);
+        let messages = adapt_messages(&request.messages, profile);
+        let body = chat_request(&request.model, &messages, self.temperature, self.max_tokens);
         let mut builder = self
             .client
             .post(&self.endpoint)
@@ -515,6 +577,56 @@ fn truncate_message(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_json(model: &str) -> serde_json::Value {
+        let messages = vec![RequestMessage {
+            role: "system",
+            content: "Be helpful".into(),
+        }];
+        let profile = ModelApiProfile::for_model(model);
+        let messages = adapt_messages(&messages, profile);
+        serde_json::to_value(chat_request(model, &messages, 0.5, 4096))
+            .expect("chat request must serialize")
+    }
+
+    #[test]
+    fn supported_reasoning_models_use_compatible_parameters() {
+        for model in &SUPPORTED_OPENAI_MODELS[..8] {
+            let request = request_json(model);
+            assert_eq!(request["max_completion_tokens"], 4096, "{model}");
+            assert!(request.get("max_tokens").is_none(), "{model}");
+            assert!(request.get("temperature").is_none(), "{model}");
+            assert_eq!(request["messages"][0]["role"], "developer", "{model}");
+        }
+    }
+
+    #[test]
+    fn supported_non_reasoning_models_keep_sampling_parameters() {
+        for model in &SUPPORTED_OPENAI_MODELS[8..] {
+            let request = request_json(model);
+            assert_eq!(request["max_completion_tokens"], 4096, "{model}");
+            assert_eq!(request["temperature"], 0.5, "{model}");
+            assert!(request.get("max_tokens").is_none(), "{model}");
+            assert_eq!(request["messages"][0]["role"], "system", "{model}");
+        }
+    }
+
+    #[test]
+    fn reasoning_snapshots_use_the_reasoning_profile() {
+        let request = request_json("gpt-5.4-2026-03-05");
+        assert_eq!(request["max_completion_tokens"], 4096);
+        assert!(request.get("temperature").is_none());
+        assert_eq!(request["messages"][0]["role"], "developer");
+    }
+
+    #[test]
+    fn unknown_compatible_models_keep_legacy_parameters() {
+        let request = request_json("local-chat-model");
+        assert_eq!(request["max_tokens"], 4096);
+        assert_eq!(request["temperature"], 0.5);
+        assert!(request.get("max_completion_tokens").is_none());
+        assert_eq!(request["messages"][0]["role"], "system");
+    }
 
     #[test]
     fn parses_sse_event() {

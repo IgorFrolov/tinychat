@@ -9,6 +9,19 @@ const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 
+pub const SUPPORTED_OPENAI_MODELS: [&str; 10] = [
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5-mini",
+    "gpt-4.1-mini",
+    "gpt-4o-mini",
+];
+
 #[derive(Parser, Debug)]
 #[command(name = "tinychat", version, about)]
 pub struct Cli {
@@ -80,7 +93,12 @@ impl AppConfig {
                 .ok()
                 .map(|value| value.split(',').map(str::to_owned).collect())
         });
-        let mut models = parse_models(raw_models.unwrap_or_default());
+        let mut models = raw_models.map(parse_models).unwrap_or_else(|| {
+            SUPPORTED_OPENAI_MODELS
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect()
+        });
         if model.is_empty() {
             bail!("model must not be empty");
         }
@@ -189,5 +207,17 @@ mod tests {
             ]),
             vec!["alpha", "beta"]
         );
+    }
+
+    #[test]
+    fn supported_openai_models_are_unique_and_include_default() {
+        let models = parse_models(
+            SUPPORTED_OPENAI_MODELS
+                .iter()
+                .map(|model| (*model).to_owned())
+                .collect(),
+        );
+        assert_eq!(models.len(), 10);
+        assert!(models.iter().any(|model| model == DEFAULT_MODEL));
     }
 }
