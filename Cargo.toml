@@ -15,7 +15,7 @@ idna_adapter = "=1.0.0"
 indexmap = "=2.7.1"
 instability = "=0.3.1"
 ratatui = "=0.29.0"
-reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "=0.11.27", default-features = false, features = ["json", "rustls-tls", "socks", "stream"] }
 serde = { version = "=1.0.217", features = ["derive"] }
 serde_json = "=1.0.137"
 smawk = "=0.3.2"
