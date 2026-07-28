@@ -12,6 +12,7 @@ mod ui;
 use std::{
     io::{self, Stdout},
     panic,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use anyhow::{Context, Result};
@@ -21,7 +22,11 @@ use clap::Parser;
 use config::{AppConfig, Cli};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableMouseCapture, EnableMouseCapture, EventStream},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -29,15 +34,45 @@ use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
+static KEYBOARD_ENHANCEMENT_PUSHED: AtomicBool = AtomicBool::new(false);
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    enhanced_keys_supported: bool,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("failed to enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide) {
+
+        let enhanced_keys_supported = matches!(
+            crossterm::terminal::supports_keyboard_enhancement(),
+            Ok(true)
+        );
+        if enhanced_keys_supported {
+            KEYBOARD_ENHANCEMENT_PUSHED.store(true, Ordering::SeqCst);
+            if let Err(error) = execute!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            ) {
+                restore_terminal();
+                return Err(error).context("failed to enable enhanced keyboard input");
+            }
+        }
+
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        ) {
             restore_terminal();
             return Err(error).context("failed to enter alternate screen");
         }
@@ -48,7 +83,10 @@ impl TerminalGuard {
                 return Err(error).context("failed to initialize TUI");
             }
         };
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            enhanced_keys_supported,
+        })
     }
 
     fn set_cursor_visible(&mut self, visible: bool) -> io::Result<()> {
@@ -67,13 +105,18 @@ impl Drop for TerminalGuard {
 }
 
 fn restore_terminal() {
-    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    if KEYBOARD_ENHANCEMENT_PUSHED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
-        io::stdout(),
+        stdout,
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
         Show
     );
+    let _ = disable_raw_mode();
 }
 
 fn install_panic_hook() {
@@ -91,7 +134,9 @@ async fn main() -> Result<()> {
     install_panic_hook();
 
     let mut terminal = TerminalGuard::enter()?;
-    let result = run(&mut terminal, App::new(config), api_client).await;
+    let mut app = App::new(config);
+    app.set_enhanced_keys_supported(terminal.enhanced_keys_supported);
+    let result = run(&mut terminal, app, api_client).await;
     drop(terminal);
     result
 }

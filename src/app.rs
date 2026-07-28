@@ -38,6 +38,7 @@ pub struct ActiveRequest {
 pub struct HistoryMetrics {
     pub total_lines: usize,
     pub viewport_lines: usize,
+    pub input_width: usize,
 }
 
 pub struct App {
@@ -52,6 +53,8 @@ pub struct App {
     pub selected_model_index: usize,
     pub model_selector_open: bool,
     pub model_selector_index: usize,
+    pub shortcuts_open: bool,
+    pub enhanced_keys_supported: bool,
     pub request_status: RequestStatus,
     pub active_request: Option<ActiveRequest>,
     pub next_message_id: u64,
@@ -82,6 +85,8 @@ impl App {
             selected_model_index,
             model_selector_open: false,
             model_selector_index: selected_model_index,
+            shortcuts_open: false,
+            enhanced_keys_supported: false,
             request_status: RequestStatus::Idle,
             active_request: None,
             next_message_id: 1,
@@ -101,14 +106,14 @@ impl App {
             .unwrap_or(self.config.model.as_str())
     }
 
+    pub fn set_enhanced_keys_supported(&mut self, supported: bool) {
+        self.enhanced_keys_supported = supported;
+    }
+
     pub fn elapsed(&self) -> Option<Duration> {
         self.active_request
             .as_ref()
             .map(|request| request.started_at.elapsed())
-    }
-
-    pub fn active_task_count(&self) -> usize {
-        usize::from(self.active_request.is_some())
     }
 
     pub fn handle_terminal_event(
@@ -122,6 +127,11 @@ impl App {
             }
             Event::Mouse(mouse) => {
                 self.handle_mouse(mouse, metrics);
+                None
+            }
+            Event::Paste(text) => {
+                self.leave_history_navigation();
+                self.input.insert_str(&normalize_paste(&text));
                 None
             }
             Event::Resize(_, _) => {
@@ -235,6 +245,11 @@ impl App {
         }
 
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if key.code == KeyCode::Esc && self.shortcuts_open {
+            self.shortcuts_open = false;
+            return None;
+        }
         if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
             if self.active_request.is_some() {
                 self.cancel_active_request();
@@ -247,7 +262,8 @@ impl App {
             self.cancel_active_request();
             return None;
         }
-        if control && matches!(key.code, KeyCode::Char('m' | 'M')) {
+        if alt && matches!(key.code, KeyCode::Char('m' | 'M')) {
+            self.shortcuts_open = false;
             self.model_selector_index = self.selected_model_index;
             self.model_selector_open = true;
             return None;
@@ -256,6 +272,11 @@ impl App {
             self.clear_session();
             return None;
         }
+        if !control && !alt && self.input.is_empty() && matches!(key.code, KeyCode::Char('?')) {
+            self.shortcuts_open = !self.shortcuts_open;
+            return None;
+        }
+        self.shortcuts_open = false;
 
         match key.code {
             KeyCode::PageUp => self.scroll_up(metrics.viewport_lines, metrics),
@@ -267,11 +288,35 @@ impl App {
             KeyCode::Char('u' | 'U') if control && self.input.is_empty() => {
                 self.scroll_up(half_viewport(metrics.viewport_lines), metrics);
             }
-            KeyCode::Char('d' | 'D') if control => {
+            KeyCode::Char('d' | 'D') if control && self.input.is_empty() => {
                 self.scroll_down(half_viewport(metrics.viewport_lines));
             }
+            KeyCode::Char('d' | 'D') if control => {
+                self.leave_history_navigation();
+                self.input.delete();
+            }
+            KeyCode::Char('d' | 'D') if alt => {
+                self.leave_history_navigation();
+                self.input.delete_next_word();
+            }
             KeyCode::Char('a' | 'A') if control => self.input.move_home(),
+            KeyCode::Char('b' | 'B') if control => self.input.move_left(),
             KeyCode::Char('e' | 'E') if control => self.input.move_end(),
+            KeyCode::Char('f' | 'F') if control => self.input.move_right(),
+            KeyCode::Char('p' | 'P') if control => {
+                self.move_input_or_history_up(metrics.input_width);
+            }
+            KeyCode::Char('n' | 'N') if control => {
+                self.move_input_or_history_down(metrics.input_width);
+            }
+            KeyCode::Char('j' | 'J' | 'm' | 'M') if control => {
+                self.leave_history_navigation();
+                self.input.insert_newline();
+            }
+            KeyCode::Char('h' | 'H') if control => {
+                self.leave_history_navigation();
+                self.input.backspace();
+            }
             KeyCode::Char('w' | 'W') if control => {
                 self.leave_history_navigation();
                 self.input.delete_previous_word();
@@ -284,21 +329,63 @@ impl App {
                 self.leave_history_navigation();
                 self.input.delete_to_start();
             }
-            KeyCode::Enter => return self.start_request(),
+            KeyCode::Char('y' | 'Y') if control => {
+                self.leave_history_navigation();
+                self.input.yank();
+            }
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.leave_history_navigation();
+                self.input.insert_newline();
+            }
+            KeyCode::Enter if !control => return self.start_request(),
+            KeyCode::Left
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.input.move_word_left();
+            }
+            KeyCode::Right
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.input.move_word_right();
+            }
             KeyCode::Left => self.input.move_left(),
             KeyCode::Right => self.input.move_right(),
             KeyCode::Home => self.input.move_home(),
             KeyCode::End => self.input.move_end(),
+            KeyCode::Backspace
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.leave_history_navigation();
+                self.input.delete_previous_word();
+            }
             KeyCode::Backspace => {
                 self.leave_history_navigation();
                 self.input.backspace();
+            }
+            KeyCode::Delete
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
+                self.leave_history_navigation();
+                self.input.delete_next_word();
             }
             KeyCode::Delete => {
                 self.leave_history_navigation();
                 self.input.delete();
             }
-            KeyCode::Up => self.history_previous(),
-            KeyCode::Down => self.history_next(),
+            KeyCode::Up => self.move_input_or_history_up(metrics.input_width),
+            KeyCode::Down => self.move_input_or_history_down(metrics.input_width),
             KeyCode::Char(character)
                 if !key
                     .modifiers
@@ -313,8 +400,8 @@ impl App {
     }
 
     fn handle_model_selector_key(&mut self, key: KeyEvent) {
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        if key.code == KeyCode::Esc || (control && matches!(key.code, KeyCode::Char('m' | 'M'))) {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if key.code == KeyCode::Esc || (alt && matches!(key.code, KeyCode::Char('m' | 'M'))) {
             self.model_selector_open = false;
             return;
         }
@@ -350,7 +437,7 @@ impl App {
             return None;
         }
 
-        let text = self.input.clear();
+        let text = self.input.clear().trim().to_owned();
         if self.input_history.last() != Some(&text) {
             self.input_history.push(text.clone());
         }
@@ -427,6 +514,7 @@ impl App {
         self.history_layout.invalidate();
         self.scroll = ScrollState::default();
         self.request_status = RequestStatus::Idle;
+        self.shortcuts_open = false;
         self.received_chunks = 0;
         self.usage = None;
         self.new_output_while_scrolled = false;
@@ -484,32 +572,110 @@ impl App {
             self.input_history_draft.clear();
         }
     }
+
+    fn move_input_or_history_up(&mut self, width: usize) {
+        if self.input_history_index.is_some() || !self.input.move_up(width.max(1)) {
+            self.history_previous();
+        }
+    }
+
+    fn move_input_or_history_down(&mut self, width: usize) {
+        if self.input_history_index.is_some() || !self.input.move_down(width.max(1)) {
+            self.history_next();
+        }
+    }
 }
 
 fn half_viewport(viewport: usize) -> usize {
     (viewport / 2).max(1)
 }
 
-pub fn format_elapsed(duration: Duration) -> String {
-    let total = duration.as_secs();
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let seconds = total % 60;
-    if hours > 0 {
-        format!("{hours:02}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes:02}:{seconds:02}")
-    }
+fn normalize_paste(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn test_app() -> App {
+        App::new(AppConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: String::new(),
+            model: "gpt-4.1-mini".into(),
+            models: vec!["gpt-4.1-mini".into()],
+            system_prompt: String::new(),
+            temperature: 0.7,
+            max_tokens: 4096,
+            timeout: Duration::from_secs(120),
+        })
+    }
+
     #[test]
-    fn formats_elapsed_time() {
-        assert_eq!(format_elapsed(Duration::from_secs(0)), "00:00");
-        assert_eq!(format_elapsed(Duration::from_secs(87)), "01:27");
-        assert_eq!(format_elapsed(Duration::from_secs(3861)), "01:04:21");
+    fn shift_enter_inserts_newline_and_plain_enter_submits() {
+        let mut app = test_app();
+        let metrics = HistoryMetrics {
+            input_width: 40,
+            ..HistoryMetrics::default()
+        };
+        app.input.set_text("first".into());
+
+        let newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(app.handle_key(newline, metrics).is_none());
+        assert_eq!(app.input.text(), "first\n");
+
+        app.input.insert_str("second");
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let request = app.handle_key(submit, metrics);
+        assert!(request.is_some());
+        assert_eq!(app.messages[0].content, "first\nsecond");
+    }
+
+    #[test]
+    fn codex_newline_shortcuts_insert_instead_of_submit() {
+        let shortcuts = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL),
+        ];
+        for shortcut in shortcuts {
+            let mut app = test_app();
+            app.input.set_text("line".into());
+            assert!(app
+                .handle_key(shortcut, HistoryMetrics::default())
+                .is_none());
+            assert_eq!(app.input.text(), "line\n");
+            assert!(app.messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn question_mark_toggles_shortcuts_only_for_an_empty_draft() {
+        let mut app = test_app();
+        let metrics = HistoryMetrics::default();
+        let question_mark = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
+
+        app.handle_key(question_mark, metrics);
+        assert!(app.shortcuts_open);
+        app.handle_key(question_mark, metrics);
+        assert!(!app.shortcuts_open);
+
+        app.input.set_text("draft".into());
+        app.handle_key(question_mark, metrics);
+        assert_eq!(app.input.text(), "draft?");
+        assert!(!app.shortcuts_open);
+    }
+
+    #[test]
+    fn paste_normalizes_newlines_and_inserts_at_cursor() {
+        let mut app = test_app();
+        app.input.set_text("ac".into());
+        app.input.move_left();
+        app.handle_terminal_event(
+            Event::Paste("b\r\nline\rnext".into()),
+            HistoryMetrics::default(),
+        );
+        assert_eq!(app.input.text(), "ab\nline\nnextc");
     }
 }
