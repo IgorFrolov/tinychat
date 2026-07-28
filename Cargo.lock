@@ -802,6 +802,7 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-rustls",
+ "tokio-socks",
  "tokio-util",
  "tower-service",
  "url",
@@ -1099,11 +1100,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d452f284b73e6d76dd36758a0c8684b1d5be31f92b89d07fd5822175732206fc"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.11",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1134,7 +1155,7 @@ dependencies = [
  "serde_json",
  "smawk",
  "textwrap",
- "thiserror",
+ "thiserror 2.0.11",
  "tokio",
  "tokio-util",
  "unicode-segmentation",
@@ -1176,6 +1197,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
  "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-socks"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d4770b8024672c1101b3f6733eab95b18007dbe0847a8afe341fcf79e06043f"
+dependencies = [
+ "either",
+ "futures-util",
+ "thiserror 1.0.69",
  "tokio",
 ]
 

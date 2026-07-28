@@ -131,6 +131,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_socks5_and_socks5h_proxies() {
+        for proxy_url in [
+            "socks5://127.0.0.1:1080",
+            "socks5h://user:password@127.0.0.1:1080",
+        ] {
+            let settings = ProxySettings {
+                http: Some(proxy_url.into()),
+                https: Some(proxy_url.into()),
+                no_proxy: Some("localhost,127.0.0.1,::1".into()),
+            };
+            assert!(
+                configure(reqwest::Client::builder(), &settings).is_ok(),
+                "{proxy_url} should be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn uppercase_proxy_has_priority() {
         let parsed = settings(&[
             ("HTTP_PROXY", "http://upper:8000"),
