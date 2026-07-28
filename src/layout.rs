@@ -4,10 +4,11 @@ use crate::model::{Message, MessageState, Role};
 
 #[derive(Clone, Debug)]
 pub enum VisualLine {
-    EmptyHistory,
-    Metadata { role: Role, state: MessageState },
-    Text(String),
-    StreamingPlaceholder,
+    UserPadding,
+    UserText { text: String, first: bool },
+    AssistantText { text: String, first: bool },
+    SystemText { text: String, first: bool },
+    MessageState(MessageState),
     Blank,
 }
 
@@ -42,34 +43,91 @@ impl HistoryLayout {
         self.width = width;
         self.dirty = false;
         self.lines.clear();
-        if messages.is_empty() {
-            self.lines.push(VisualLine::EmptyHistory);
-            return;
-        }
 
         for message in messages {
-            self.lines.push(VisualLine::Metadata {
-                role: message.role,
-                state: message.state,
-            });
-            if message.content.is_empty() {
-                if message.state == MessageState::Streaming {
-                    self.lines.push(VisualLine::StreamingPlaceholder);
-                }
-            } else {
-                for physical_line in message.content.split('\n') {
-                    if physical_line.is_empty() {
-                        self.lines.push(VisualLine::Blank);
-                        continue;
-                    }
-                    self.lines.extend(
-                        textwrap::wrap(physical_line, Options::new(width).break_words(true))
+            if message.role == Role::Assistant
+                && message.content.is_empty()
+                && message.state == MessageState::Streaming
+            {
+                continue;
+            }
+
+            let wrap_width = match message.role {
+                Role::User => width.saturating_sub(3).max(1),
+                Role::Assistant | Role::System => width.saturating_sub(2).max(1),
+            };
+            let mut first = true;
+
+            if message.role == Role::User {
+                self.lines.push(VisualLine::UserPadding);
+            }
+
+            if !message.content.is_empty() {
+                for physical_line in message.content.trim_end_matches('\n').split('\n') {
+                    let wrapped = if physical_line.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        textwrap::wrap(physical_line, Options::new(wrap_width).break_words(true))
                             .into_iter()
-                            .map(|line| VisualLine::Text(line.into_owned())),
-                    );
+                            .map(|line| line.into_owned())
+                            .collect()
+                    };
+                    for text in wrapped {
+                        self.lines.push(match message.role {
+                            Role::User => VisualLine::UserText { text, first },
+                            Role::Assistant => VisualLine::AssistantText { text, first },
+                            Role::System => VisualLine::SystemText { text, first },
+                        });
+                        first = false;
+                    }
                 }
             }
-            self.lines.push(VisualLine::Blank);
+
+            if message.role == Role::User {
+                self.lines.push(VisualLine::UserPadding);
+            } else if message.state != MessageState::Complete {
+                self.lines.push(VisualLine::MessageState(message.state));
+            }
+
+            if !matches!(self.lines.last(), Some(VisualLine::Blank)) {
+                self.lines.push(VisualLine::Blank);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_codex_style_message_shapes() {
+        let messages = vec![
+            Message {
+                id: 1,
+                role: Role::User,
+                content: "hello".into(),
+                state: MessageState::Complete,
+            },
+            Message {
+                id: 2,
+                role: Role::Assistant,
+                content: "hi there".into(),
+                state: MessageState::Complete,
+            },
+        ];
+        let mut layout = HistoryLayout::default();
+        layout.refresh(&messages, 40);
+
+        assert!(matches!(layout.lines[0], VisualLine::UserPadding));
+        assert!(matches!(
+            layout.lines[1],
+            VisualLine::UserText { first: true, .. }
+        ));
+        assert!(matches!(layout.lines[2], VisualLine::UserPadding));
+        assert!(matches!(
+            layout.lines[4],
+            VisualLine::AssistantText { first: true, .. }
+        ));
     }
 }
