@@ -27,3 +27,8 @@ tokio-util = "=0.7.13"
 unicode-segmentation = "=1.12.0"
 unicode-width = "=0.2.0"
 url = "=2.5.4"
+
+[patch.crates-io]
+# Keep modifier shortcuts tied to the physical/base-layout key reported by
+# the Kitty keyboard protocol. Upstream crossterm 0.28 discards that field.
+crossterm = { path = "vendor/crossterm" }

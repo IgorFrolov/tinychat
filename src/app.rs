@@ -1,8 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -12,8 +10,9 @@ use crate::{
     input::InputState,
     layout::HistoryLayout,
     model::{messages_for_request, Message, MessageState, Role, TokenUsage},
-    scroll::ScrollState,
 };
+
+const QUIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestStatus {
@@ -35,20 +34,18 @@ pub struct ActiveRequest {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct HistoryMetrics {
-    pub total_lines: usize,
-    pub viewport_lines: usize,
+pub struct UiMetrics {
     pub input_width: usize,
 }
 
 pub struct App {
     pub messages: Vec<Message>,
+    pub transcript_start: usize,
     pub history_layout: HistoryLayout,
     pub input: InputState,
     pub input_history: Vec<String>,
     pub input_history_index: Option<usize>,
     input_history_draft: String,
-    pub scroll: ScrollState,
     pub models: Vec<String>,
     pub selected_model_index: usize,
     pub model_selector_open: bool,
@@ -61,7 +58,7 @@ pub struct App {
     pub next_request_id: u64,
     pub received_chunks: u64,
     pub usage: Option<TokenUsage>,
-    pub new_output_while_scrolled: bool,
+    quit_requested_at: Option<Instant>,
     pub should_quit: bool,
     pub config: AppConfig,
 }
@@ -75,12 +72,12 @@ impl App {
             .unwrap_or(0);
         Self {
             messages: Vec::new(),
+            transcript_start: 0,
             history_layout: HistoryLayout::default(),
             input: InputState::default(),
             input_history: Vec::new(),
             input_history_index: None,
             input_history_draft: String::new(),
-            scroll: ScrollState::default(),
             models: config.models.clone(),
             selected_model_index,
             model_selector_open: false,
@@ -93,7 +90,7 @@ impl App {
             next_request_id: 1,
             received_chunks: 0,
             usage: None,
-            new_output_while_scrolled: false,
+            quit_requested_at: None,
             should_quit: false,
             config,
         }
@@ -106,38 +103,33 @@ impl App {
             .unwrap_or(self.config.model.as_str())
     }
 
-    pub fn set_enhanced_keys_supported(&mut self, supported: bool) {
-        self.enhanced_keys_supported = supported;
-    }
-
     pub fn elapsed(&self) -> Option<Duration> {
         self.active_request
             .as_ref()
             .map(|request| request.started_at.elapsed())
     }
 
+    pub fn quit_confirmation_active(&self) -> bool {
+        self.quit_requested_at
+            .is_some_and(|requested_at| requested_at.elapsed() < QUIT_CONFIRMATION_TIMEOUT)
+    }
+
     pub fn handle_terminal_event(
         &mut self,
         event: Event,
-        metrics: HistoryMetrics,
+        metrics: UiMetrics,
     ) -> Option<(ApiRequest, CancellationToken)> {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 self.handle_key(key, metrics)
             }
-            Event::Mouse(mouse) => {
-                self.handle_mouse(mouse, metrics);
-                None
-            }
             Event::Paste(text) => {
+                self.quit_requested_at = None;
                 self.leave_history_navigation();
                 self.input.insert_str(&normalize_paste(&text));
                 None
             }
-            Event::Resize(_, _) => {
-                self.clamp_scroll(metrics);
-                None
-            }
+            Event::Resize(_, _) => None,
             _ => None,
         }
     }
@@ -170,11 +162,6 @@ impl App {
                 }
                 self.history_layout.invalidate();
                 self.request_status = RequestStatus::Streaming;
-                if self.scroll.follow_output {
-                    self.scroll.offset_from_bottom = 0;
-                } else {
-                    self.new_output_while_scrolled = true;
-                }
             }
             ApiEvent::Usage {
                 prompt_tokens,
@@ -206,16 +193,20 @@ impl App {
         }
     }
 
-    pub fn clamp_scroll(&mut self, metrics: HistoryMetrics) {
-        self.scroll
-            .clamp(metrics.total_lines, metrics.viewport_lines);
-        if self.scroll.follow_output {
-            self.new_output_while_scrolled = false;
-        }
+    pub fn refresh_history_layout(&mut self, width: usize) {
+        self.history_layout
+            .refresh(&self.messages[self.transcript_start..], width);
     }
 
-    pub fn refresh_history_layout(&mut self, width: usize) {
-        self.history_layout.refresh(&self.messages, width);
+    pub fn stable_transcript_end(&self) -> usize {
+        self.messages
+            .len()
+            .saturating_sub(usize::from(self.active_request.is_some()))
+    }
+
+    pub fn mark_transcript_committed(&mut self, end: usize) {
+        self.transcript_start = end.min(self.messages.len());
+        self.history_layout.invalidate();
     }
 
     pub fn cancel_active_request(&mut self) {
@@ -237,25 +228,25 @@ impl App {
     fn handle_key(
         &mut self,
         key: KeyEvent,
-        metrics: HistoryMetrics,
+        metrics: UiMetrics,
     ) -> Option<(ApiRequest, CancellationToken)> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if control && matches!(key.code, KeyCode::Char('c' | 'C' | 'с' | 'С')) {
+            if key.kind == KeyEventKind::Press {
+                self.handle_quit_shortcut();
+            }
+            return None;
+        }
+        self.quit_requested_at = None;
+
         if self.model_selector_open {
             self.handle_model_selector_key(key);
             return None;
         }
 
-        let control = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
         if key.code == KeyCode::Esc && self.shortcuts_open {
             self.shortcuts_open = false;
-            return None;
-        }
-        if control && matches!(key.code, KeyCode::Char('c' | 'C')) {
-            if self.active_request.is_some() {
-                self.cancel_active_request();
-            } else {
-                self.should_quit = true;
-            }
             return None;
         }
         if key.code == KeyCode::Esc {
@@ -279,18 +270,6 @@ impl App {
         self.shortcuts_open = false;
 
         match key.code {
-            KeyCode::PageUp => self.scroll_up(metrics.viewport_lines, metrics),
-            KeyCode::PageDown => self.scroll_down(metrics.viewport_lines),
-            KeyCode::Home if control => {
-                self.scroll.top(metrics.total_lines, metrics.viewport_lines);
-            }
-            KeyCode::End if control => self.scroll_to_bottom(),
-            KeyCode::Char('u' | 'U') if control && self.input.is_empty() => {
-                self.scroll_up(half_viewport(metrics.viewport_lines), metrics);
-            }
-            KeyCode::Char('d' | 'D') if control && self.input.is_empty() => {
-                self.scroll_down(half_viewport(metrics.viewport_lines));
-            }
             KeyCode::Char('d' | 'D') if control => {
                 self.leave_history_navigation();
                 self.input.delete();
@@ -399,6 +378,18 @@ impl App {
         None
     }
 
+    fn handle_quit_shortcut(&mut self) {
+        if self.quit_confirmation_active() {
+            self.should_quit = true;
+            return;
+        }
+
+        self.cancel_active_request();
+        self.model_selector_open = false;
+        self.shortcuts_open = false;
+        self.quit_requested_at = Some(Instant::now());
+    }
+
     fn handle_model_selector_key(&mut self, key: KeyEvent) {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if key.code == KeyCode::Esc || (alt && matches!(key.code, KeyCode::Char('m' | 'M'))) {
@@ -417,17 +408,6 @@ impl App {
                 self.selected_model_index = self.model_selector_index;
                 self.model_selector_open = false;
             }
-            _ => {}
-        }
-    }
-
-    fn handle_mouse(&mut self, mouse: MouseEvent, metrics: HistoryMetrics) {
-        if self.model_selector_open {
-            return;
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_up(3, metrics),
-            MouseEventKind::ScrollDown => self.scroll_down(3),
             _ => {}
         }
     }
@@ -473,8 +453,6 @@ impl App {
         self.request_status = RequestStatus::Connecting;
         self.received_chunks = 0;
         self.usage = None;
-        self.scroll.bottom();
-        self.new_output_while_scrolled = false;
 
         let request = ApiRequest {
             id: request_id,
@@ -511,30 +489,12 @@ impl App {
     fn clear_session(&mut self) {
         self.cancel_active_request();
         self.messages.clear();
+        self.transcript_start = 0;
         self.history_layout.invalidate();
-        self.scroll = ScrollState::default();
         self.request_status = RequestStatus::Idle;
         self.shortcuts_open = false;
         self.received_chunks = 0;
         self.usage = None;
-        self.new_output_while_scrolled = false;
-    }
-
-    fn scroll_up(&mut self, amount: usize, metrics: HistoryMetrics) {
-        self.scroll
-            .up(amount, metrics.total_lines, metrics.viewport_lines);
-    }
-
-    fn scroll_down(&mut self, amount: usize) {
-        self.scroll.down(amount);
-        if self.scroll.follow_output {
-            self.new_output_while_scrolled = false;
-        }
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.scroll.bottom();
-        self.new_output_while_scrolled = false;
     }
 
     fn history_previous(&mut self) {
@@ -586,10 +546,6 @@ impl App {
     }
 }
 
-fn half_viewport(viewport: usize) -> usize {
-    (viewport / 2).max(1)
-}
-
 fn normalize_paste(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -614,10 +570,7 @@ mod tests {
     #[test]
     fn shift_enter_inserts_newline_and_plain_enter_submits() {
         let mut app = test_app();
-        let metrics = HistoryMetrics {
-            input_width: 40,
-            ..HistoryMetrics::default()
-        };
+        let metrics = UiMetrics { input_width: 40 };
         app.input.set_text("first".into());
 
         let newline = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
@@ -642,9 +595,7 @@ mod tests {
         for shortcut in shortcuts {
             let mut app = test_app();
             app.input.set_text("line".into());
-            assert!(app
-                .handle_key(shortcut, HistoryMetrics::default())
-                .is_none());
+            assert!(app.handle_key(shortcut, UiMetrics::default()).is_none());
             assert_eq!(app.input.text(), "line\n");
             assert!(app.messages.is_empty());
         }
@@ -653,7 +604,7 @@ mod tests {
     #[test]
     fn question_mark_toggles_shortcuts_only_for_an_empty_draft() {
         let mut app = test_app();
-        let metrics = HistoryMetrics::default();
+        let metrics = UiMetrics::default();
         let question_mark = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
 
         app.handle_key(question_mark, metrics);
@@ -672,10 +623,124 @@ mod tests {
         let mut app = test_app();
         app.input.set_text("ac".into());
         app.input.move_left();
-        app.handle_terminal_event(
-            Event::Paste("b\r\nline\rnext".into()),
-            HistoryMetrics::default(),
-        );
+        app.handle_terminal_event(Event::Paste("b\r\nline\rnext".into()), UiMetrics::default());
         assert_eq!(app.input.text(), "ab\nline\nnextc");
+    }
+
+    #[test]
+    fn only_stable_messages_are_ready_for_terminal_scrollback() {
+        let mut app = test_app();
+        app.input.set_text("hello".into());
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.handle_key(submit, UiMetrics::default()).is_some());
+
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.stable_transcript_end(), 1);
+        app.mark_transcript_committed(1);
+        app.refresh_history_layout(40);
+        assert!(app.history_layout.lines.is_empty());
+
+        let request_id = app.active_request.as_ref().expect("active request").id;
+        app.handle_api_event(ApiEvent::Delta {
+            request_id,
+            content: "hi".into(),
+        });
+        assert_eq!(app.stable_transcript_end(), 1);
+
+        app.handle_api_event(ApiEvent::Finished { request_id });
+        assert_eq!(app.stable_transcript_end(), 2);
+        app.mark_transcript_committed(2);
+        app.refresh_history_layout(40);
+        assert!(app.history_layout.lines.is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_requires_confirmation_before_quitting() {
+        let mut app = test_app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+        assert!(app.quit_confirmation_active());
+        assert!(!app.should_quit);
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn russian_layout_ctrl_c_requires_confirmation_before_quitting() {
+        let mut app = test_app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+        assert!(app.quit_confirmation_active());
+        assert!(!app.should_quit);
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn holding_ctrl_c_does_not_confirm_exit_via_key_repeat() {
+        let mut app = test_app();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let repeated_ctrl_c = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        );
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+        app.handle_key(repeated_ctrl_c, UiMetrics::default());
+
+        assert!(app.quit_confirmation_active());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn expired_quit_confirmation_requires_two_fresh_presses() {
+        let mut app = test_app();
+        app.quit_requested_at = Some(
+            Instant::now()
+                .checked_sub(QUIT_CONFIRMATION_TIMEOUT + Duration::from_millis(1))
+                .expect("past instant"),
+        );
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+
+        assert!(app.quit_confirmation_active());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_active_request_then_requires_confirmation() {
+        let mut app = test_app();
+        app.input.set_text("hello".into());
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.handle_key(submit, UiMetrics::default()).is_some());
+        assert!(app.active_request.is_some());
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_c, UiMetrics::default());
+        assert!(app.active_request.is_none());
+        assert!(app.quit_confirmation_active());
+        assert!(!app.should_quit);
+
+        app.handle_key(ctrl_c, UiMetrics::default());
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_closes_model_selector_and_still_requests_exit() {
+        let mut app = test_app();
+        app.model_selector_open = true;
+
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_c, UiMetrics::default());
+
+        assert!(!app.model_selector_open);
+        assert!(app.quit_confirmation_active());
+        assert!(!app.should_quit);
     }
 }
