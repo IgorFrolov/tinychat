@@ -28,6 +28,22 @@ accepted and use the legacy OpenAI-compatible `max_tokens` request shape.
 The 10 models are available in the model selector by default. Override the
 list with a comma-separated `OPENAI_MODELS` value or `--models`.
 
+## Selecting and copying text
+
+tinychat renders inline on the terminal's normal screen, like Codex CLI.
+Completed messages move into the terminal's native scrollback instead of a
+fixed in-app transcript, and the composer follows the active conversation
+rather than staying pinned to the bottom of the window.
+
+Use the mouse or your terminal's normal scrollback controls to review the full
+conversation. Drag to select text, then use the terminal's usual copy command
+(for example, `Cmd+C` on macOS or `Ctrl+Shift+C` on Linux).
+
+Press `Ctrl+C` twice to quit. The shortcut follows the physical `C` key, so it
+works without switching away from the current keyboard layout. tinychat keeps
+terminal keyboard enhancement disabled so terminals emit the layout-neutral
+`Ctrl+C` control byte.
+
 ## Configuration
 
 ```sh

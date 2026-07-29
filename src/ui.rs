@@ -1,22 +1,24 @@
 use std::time::Duration;
 
 use ratatui::{
+    buffer::Buffer,
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    app::{App, HistoryMetrics, RequestStatus},
+    app::{App, RequestStatus, UiMetrics},
     layout::VisualLine,
     model::MessageState,
 };
 
 pub const MIN_WIDTH: u16 = 30;
 pub const MIN_HEIGHT: u16 = 8;
+pub const WELCOME_BANNER_HEIGHT: u16 = 5;
 
 const LIVE_PREFIX_COLS: u16 = 2;
 const COMPOSER_PADDING_ROWS: u16 = 2;
@@ -49,47 +51,43 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
     }
 }
 
-pub fn history_metrics(app: &App, area: Rect) -> HistoryMetrics {
+pub fn ui_metrics(area: Rect) -> UiMetrics {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        return HistoryMetrics::default();
+        return UiMetrics::default();
     }
-    let (history, _) = chat_areas(app, area);
-    HistoryMetrics {
-        total_lines: app.history_layout.lines.len(),
-        viewport_lines: usize::from(history.height),
+    UiMetrics {
         input_width: input_text_width(area.width),
     }
 }
 
 fn chat_areas(app: &App, area: Rect) -> (Rect, Rect) {
     let panel_height = panel_height(app, area).min(area.height);
-    let history_height = area.height.saturating_sub(panel_height);
+    let desired_history_height = u16::try_from(app.history_layout.lines.len()).unwrap_or(u16::MAX);
+    let content_height = panel_height
+        .saturating_add(desired_history_height)
+        .min(area.height);
+    let history_height = content_height.saturating_sub(panel_height);
     let history = Rect::new(area.x, area.y, area.width, history_height);
     let panel = Rect::new(
         area.x,
         history.bottom(),
         area.width,
-        area.bottom().saturating_sub(history.bottom()),
+        panel_height.min(area.bottom().saturating_sub(history.bottom())),
     );
-    debug_assert_eq!(history.bottom(), panel.y);
-    debug_assert_eq!(panel.bottom(), area.bottom());
     (history, panel)
 }
 
 fn render_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let lines = &app.history_layout.lines;
     let viewport = usize::from(area.height);
-    let maximum_offset = lines.len().saturating_sub(viewport);
-    let offset = app.scroll.offset_from_bottom.min(maximum_offset);
-    let start = lines.len().saturating_sub(viewport.saturating_add(offset));
+    let start = lines.len().saturating_sub(viewport);
     let end = (start + viewport).min(lines.len());
     let visible = &lines[start..end];
-    let top_padding = viewport.saturating_sub(visible.len());
 
     for (index, line) in visible.iter().enumerate() {
         let y = area
             .y
-            .saturating_add(u16::try_from(top_padding + index).unwrap_or(u16::MAX));
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
         if y >= area.bottom() {
             break;
         }
@@ -99,13 +97,71 @@ fn render_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
     }
 
-    let mut rendered_lines = Vec::with_capacity(top_padding + visible.len());
-    rendered_lines.extend((0..top_padding).map(|_| Line::default()));
-    rendered_lines.extend(visible.iter().map(visual_line));
+    let rendered_lines = visible.iter().map(visual_line).collect::<Vec<_>>();
     // HistoryLayout and the Markdown renderer already produce width-bounded
     // visual rows. A second Paragraph wrap would create rows unknown to the
-    // scroll metrics and could put the actual tail behind the fixed panel.
+    // layout and could put the actual tail behind the composer.
     frame.render_widget(Paragraph::new(Text::from(rendered_lines)), area);
+}
+
+pub fn render_transcript_buffer(buffer: &mut Buffer, lines: &[VisualLine]) {
+    for (index, line) in lines.iter().enumerate() {
+        let y = u16::try_from(index).unwrap_or(u16::MAX);
+        if y >= buffer.area.height {
+            break;
+        }
+        let row = Rect::new(
+            buffer.area.x,
+            buffer.area.y.saturating_add(y),
+            buffer.area.width,
+            1,
+        );
+        if is_user_line(line) {
+            Block::default()
+                .style(USER_MESSAGE_STYLE)
+                .render(row, buffer);
+        }
+    }
+    Paragraph::new(Text::from(
+        lines.iter().map(visual_line).collect::<Vec<_>>(),
+    ))
+    .render(buffer.area, buffer);
+}
+
+pub fn render_welcome_banner(buffer: &mut Buffer, model: &str) {
+    let area = Rect::new(
+        buffer.area.x,
+        buffer.area.y,
+        buffer.area.width.min(64),
+        WELCOME_BANNER_HEIGHT.saturating_sub(1),
+    );
+    let title = Line::from(vec![
+        Span::styled(">_ ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "tinychat",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let content = vec![
+        Line::from(Span::styled(
+            "Welcome to tinychat",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("model: ", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw(model.to_owned()),
+        ]),
+    ];
+    Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .render(area, buffer);
 }
 
 fn is_user_line(line: &VisualLine) -> bool {
@@ -240,6 +296,29 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn status_line(app: &App) -> Option<Line<'static>> {
+    if app.quit_confirmation_active() {
+        return Some(Line::from(vec![
+            Span::styled(
+                "Press ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                "ctrl+c",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                " again to exit",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
+        ]));
+    }
+
     match &app.request_status {
         RequestStatus::Connecting | RequestStatus::Streaming => {
             let elapsed = app.elapsed().unwrap_or(Duration::ZERO);
@@ -248,7 +327,7 @@ fn status_line(app: &App) -> Option<Line<'static>> {
             } else {
                 "Working"
             };
-            let mut spans = vec![
+            let spans = vec![
                 Span::styled("• ", Style::default().fg(Color::Cyan)),
                 Span::styled(label, Style::default().fg(Color::Cyan)),
                 Span::styled(
@@ -261,26 +340,13 @@ fn status_line(app: &App) -> Option<Line<'static>> {
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             ];
-            if app.new_output_while_scrolled {
-                spans.push(Span::styled(
-                    " · ↓ new output",
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
             Some(Line::from(spans))
         }
         RequestStatus::Failed(message) => Some(Line::from(vec![
             Span::styled("× ", Style::default().fg(Color::Red)),
             Span::styled(message.clone(), Style::default().fg(Color::Red)),
         ])),
-        RequestStatus::Idle | RequestStatus::Completed | RequestStatus::Cancelled => {
-            app.new_output_while_scrolled.then(|| {
-                Line::from(Span::styled(
-                    "↓ new output",
-                    Style::default().fg(Color::Cyan),
-                ))
-            })
-        }
+        RequestStatus::Idle | RequestStatus::Completed | RequestStatus::Cancelled => None,
     }
 }
 
@@ -293,23 +359,6 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    let left = if app.new_output_while_scrolled && status_height(app) == 0 {
-        Line::from(Span::styled(
-            "  ↓ new output",
-            Style::default().fg(Color::Cyan),
-        ))
-    } else if app.input.is_empty() {
-        Line::from(vec![
-            Span::styled("  ?", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(
-                " for shortcuts",
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ])
-    } else {
-        Line::default()
-    };
-    frame.render_widget(Paragraph::new(left), area);
     frame.render_widget(
         Paragraph::new(app.selected_model().to_owned())
             .alignment(Alignment::Right)
@@ -334,7 +383,10 @@ fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
         shortcut_line(newline, "insert newline"),
         shortcut_line("alt+m", "select model"),
         shortcut_line("esc", "interrupt response"),
-        shortcut_line("ctrl+c", "quit  ·  ctrl+l clear  ·  pgup/pgdn scroll"),
+        shortcut_line(
+            "ctrl+c",
+            "press twice to quit  ·  ctrl+l clear  ·  terminal scrollback",
+        ),
     ]
 }
 
@@ -485,7 +537,8 @@ mod tests {
         config::AppConfig,
         model::{Message, Role},
     };
-    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal, TerminalOptions, Viewport};
 
     #[test]
     fn compact_elapsed_matches_codex_shape() {
@@ -531,7 +584,7 @@ mod tests {
         );
         assert!(rows.iter().any(|row| row.contains("• hi there")));
         assert!(rows.iter().any(|row| row.contains("› Ask anything")));
-        assert!(rows.iter().any(|row| row.contains("? for shortcuts")));
+        assert!(rows.iter().all(|row| !row.contains("for shortcuts")));
         assert!(rows.iter().any(|row| row.contains("gpt-4.1-mini")));
     }
 
@@ -562,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_tail_stays_above_fixed_panel_after_resize() {
+    fn transcript_tail_stays_immediately_before_composer_after_resize() {
         let mut app = test_app();
         app.input
             .set_text("draft one\ndraft two\ndraft three".to_owned());
@@ -583,9 +636,8 @@ mod tests {
             app.refresh_history_layout(usize::from(width));
             let area = Rect::new(0, 0, width, height);
             let (history, panel) = chat_areas(&app, area);
-            let metrics = history_metrics(&app, area);
-            assert_eq!(metrics.viewport_lines, usize::from(history.height));
-            assert_eq!(panel.bottom(), area.bottom());
+            assert_eq!(panel.y, history.bottom());
+            assert!(panel.bottom() <= area.bottom());
 
             let mut terminal =
                 Terminal::new(TestBackend::new(width, height)).expect("terminal backend");
@@ -607,6 +659,95 @@ mod tests {
                 "panel overwrote transcript geometry at {width}x{height}"
             );
         }
+    }
+
+    #[test]
+    fn empty_composer_is_not_pinned_to_terminal_bottom() {
+        let app = test_app();
+        let area = Rect::new(0, 0, 60, 20);
+        let (history, panel) = chat_areas(&app, area);
+
+        assert_eq!(history.height, 0);
+        assert_eq!(panel.y, 0);
+        assert!(panel.bottom() < area.bottom());
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("render");
+        let rows = buffer_rows(terminal.backend().buffer());
+        let composer_row = rows
+            .iter()
+            .position(|row| row.contains("› Ask anything"))
+            .expect("composer");
+        assert!(composer_row < 4);
+    }
+
+    #[test]
+    fn committed_message_moves_above_inline_composer() {
+        let mut app = test_app();
+        app.messages = vec![Message {
+            id: 1,
+            role: Role::User,
+            content: "kept in terminal scrollback".into(),
+            state: MessageState::Complete,
+        }];
+        app.refresh_history_layout(60);
+        let committed_lines = app.history_layout.lines.clone();
+
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(60, 20),
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )
+        .expect("inline terminal");
+        terminal
+            .insert_before(
+                u16::try_from(committed_lines.len()).expect("line count"),
+                |buffer| render_transcript_buffer(buffer, &committed_lines),
+            )
+            .expect("insert history");
+
+        app.mark_transcript_committed(1);
+        app.refresh_history_layout(60);
+        terminal.draw(|frame| render(frame, &app)).expect("render");
+        let rows = buffer_rows(terminal.backend().buffer());
+        let message_row = rows
+            .iter()
+            .position(|row| row.contains("kept in terminal scrollback"))
+            .expect("committed message");
+        let composer_row = rows
+            .iter()
+            .position(|row| row.contains("› Ask anything"))
+            .expect("composer");
+
+        assert!(message_row < composer_row);
+    }
+
+    #[test]
+    fn welcome_banner_contains_product_and_model() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, WELCOME_BANNER_HEIGHT));
+        render_welcome_banner(&mut buffer, "gpt-4.1-mini");
+        let rows = buffer_rows(&buffer);
+
+        assert!(rows.iter().any(|row| row.contains(">_ tinychat")));
+        assert!(rows.iter().any(|row| row.contains("Welcome to tinychat")));
+        assert!(rows.iter().any(|row| row.contains("model: gpt-4.1-mini")));
+    }
+
+    #[test]
+    fn first_quit_shortcut_renders_confirmation() {
+        let mut app = test_app();
+        app.handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            UiMetrics::default(),
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("render");
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Press ctrl+c again to exit")));
     }
 
     #[test]
