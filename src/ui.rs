@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -37,15 +37,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         return;
     }
 
-    let panel_height = panel_height(app, area);
-    let history_height = area.height.saturating_sub(panel_height);
-    let history = Rect::new(area.x, area.y, area.width, history_height);
-    let panel = Rect::new(
-        area.x,
-        area.y.saturating_add(history_height),
-        area.width,
-        panel_height,
-    );
+    let (history, panel) = chat_areas(app, area);
 
     render_history(frame, app, history);
     render_panel(frame, app, panel);
@@ -61,11 +53,27 @@ pub fn history_metrics(app: &App, area: Rect) -> HistoryMetrics {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return HistoryMetrics::default();
     }
+    let (history, _) = chat_areas(app, area);
     HistoryMetrics {
         total_lines: app.history_layout.lines.len(),
-        viewport_lines: usize::from(area.height.saturating_sub(panel_height(app, area))),
+        viewport_lines: usize::from(history.height),
         input_width: input_text_width(area.width),
     }
+}
+
+fn chat_areas(app: &App, area: Rect) -> (Rect, Rect) {
+    let panel_height = panel_height(app, area).min(area.height);
+    let history_height = area.height.saturating_sub(panel_height);
+    let history = Rect::new(area.x, area.y, area.width, history_height);
+    let panel = Rect::new(
+        area.x,
+        history.bottom(),
+        area.width,
+        area.bottom().saturating_sub(history.bottom()),
+    );
+    debug_assert_eq!(history.bottom(), panel.y);
+    debug_assert_eq!(panel.bottom(), area.bottom());
+    (history, panel)
 }
 
 fn render_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -94,10 +102,10 @@ fn render_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let mut rendered_lines = Vec::with_capacity(top_padding + visible.len());
     rendered_lines.extend((0..top_padding).map(|_| Line::default()));
     rendered_lines.extend(visible.iter().map(visual_line));
-    frame.render_widget(
-        Paragraph::new(Text::from(rendered_lines)).wrap(Wrap { trim: false }),
-        area,
-    );
+    // HistoryLayout and the Markdown renderer already produce width-bounded
+    // visual rows. A second Paragraph wrap would create rows unknown to the
+    // scroll metrics and could put the actual tail behind the fixed panel.
+    frame.render_widget(Paragraph::new(Text::from(rendered_lines)), area);
 }
 
 fn is_user_line(line: &VisualLine) -> bool {
@@ -525,6 +533,80 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("› Ask anything")));
         assert!(rows.iter().any(|row| row.contains("? for shortcuts")));
         assert!(rows.iter().any(|row| row.contains("gpt-4.1-mini")));
+    }
+
+    #[test]
+    fn renders_h3_as_styled_heading_in_transcript() {
+        let mut app = test_app();
+        app.messages = vec![Message {
+            id: 1,
+            role: Role::Assistant,
+            content: "### Заголовок".into(),
+            state: MessageState::Complete,
+        }];
+        app.refresh_history_layout(60);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("render");
+        let buffer = terminal.backend().buffer();
+        let rows = buffer_rows(buffer);
+        let heading_row = rows
+            .iter()
+            .position(|row| row.contains("• Заголовок"))
+            .expect("styled heading row");
+
+        assert!(!rows[heading_row].contains("###"));
+        let heading_cell = &buffer[(2, heading_row as u16)];
+        assert_eq!(heading_cell.style().fg, Some(Color::Cyan));
+        assert!(heading_cell.style().add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn transcript_tail_stays_above_fixed_panel_after_resize() {
+        let mut app = test_app();
+        app.input
+            .set_text("draft one\ndraft two\ndraft three".to_owned());
+        app.messages = vec![Message {
+            id: 1,
+            role: Role::Assistant,
+            content: concat!(
+                "## Intro\n\n",
+                "A long Markdown paragraph that reflows when the terminal becomes narrower. ",
+                "It is deliberately verbose enough to occupy several visual rows.\n\n",
+                "### LAST_VISIBLE"
+            )
+            .into(),
+            state: MessageState::Complete,
+        }];
+
+        for (width, height) in [(60, 20), (34, 10), (80, 15)] {
+            app.refresh_history_layout(usize::from(width));
+            let area = Rect::new(0, 0, width, height);
+            let (history, panel) = chat_areas(&app, area);
+            let metrics = history_metrics(&app, area);
+            assert_eq!(metrics.viewport_lines, usize::from(history.height));
+            assert_eq!(panel.bottom(), area.bottom());
+
+            let mut terminal =
+                Terminal::new(TestBackend::new(width, height)).expect("terminal backend");
+            terminal.draw(|frame| render(frame, &app)).expect("render");
+            let rows = buffer_rows(terminal.backend().buffer());
+            let tail_row = rows
+                .iter()
+                .position(|row| row.contains("LAST_VISIBLE"))
+                .unwrap_or_else(|| panic!("missing transcript tail at {width}x{height}: {rows:?}"));
+
+            assert!(
+                (tail_row as u16) < panel.y,
+                "transcript tail entered panel at {width}x{height}"
+            );
+            assert!(
+                rows[usize::from(panel.y)..]
+                    .iter()
+                    .all(|row| !row.contains("LAST_VISIBLE")),
+                "panel overwrote transcript geometry at {width}x{height}"
+            );
+        }
     }
 
     #[test]

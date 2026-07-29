@@ -69,11 +69,19 @@ impl MarkdownStyles {
 impl Default for MarkdownStyles {
     fn default() -> Self {
         Self {
-            h1: Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            h2: Style::default().add_modifier(Modifier::BOLD),
-            h3: Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC),
-            h4: Style::default().add_modifier(Modifier::ITALIC),
-            h5: Style::default().add_modifier(Modifier::ITALIC),
+            h1: Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            h2: Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+            h3: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            h4: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::ITALIC),
+            h5: Style::default().add_modifier(Modifier::BOLD),
             h6: Style::default().add_modifier(Modifier::ITALIC | Modifier::DIM),
             strong: Style::default().add_modifier(Modifier::BOLD),
             emphasis: Style::default().add_modifier(Modifier::ITALIC),

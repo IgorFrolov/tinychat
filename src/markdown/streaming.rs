@@ -316,7 +316,60 @@ mod tests {
         markdown.append("A heading", &styles);
         markdown.append("\n---------", &styles);
         assert_eq!(markdown.stable_source_len, 0);
-        assert_eq!(strings(&markdown)[0], "## A heading");
+        assert_eq!(strings(&markdown)[0], "A heading");
+    }
+
+    #[test]
+    fn atx_h3_is_recognized_at_every_chunk_boundary() {
+        use ratatui::style::Modifier;
+
+        let styles = MarkdownStyles::default();
+        let source = "### Заголовок";
+        let split_points = source
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(source.len()))
+            .filter(|index| *index > 0);
+
+        for split in split_points {
+            let mut markdown = StreamingMarkdown::new(40);
+            markdown.append(&source[..split], &styles);
+            markdown.append(&source[split..], &styles);
+
+            let lines = markdown.lines();
+            assert_eq!(lines.len(), 1, "split at byte {split}");
+            assert_eq!(lines[0].to_string(), "Заголовок", "split at byte {split}");
+            assert!(
+                lines[0]
+                    .spans
+                    .iter()
+                    .any(|span| span.style.add_modifier.contains(Modifier::BOLD)),
+                "H3 style was lost at byte {split}: {:?}",
+                lines[0]
+            );
+        }
+    }
+
+    #[test]
+    fn atx_h3_stays_formatted_after_stable_prefix() {
+        use ratatui::{style::Color, style::Modifier};
+
+        let styles = MarkdownStyles::default();
+        let mut markdown = StreamingMarkdown::new(40);
+        markdown.append("Введение\n\n##", &styles);
+        markdown.append("# Заголовок", &styles);
+
+        assert!(markdown.stable_source_len > 0);
+        let heading = markdown
+            .lines()
+            .into_iter()
+            .find(|line| line.to_string() == "Заголовок")
+            .expect("rendered H3");
+        assert!(heading
+            .spans
+            .iter()
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD)
+                && span.style.fg == Some(Color::Cyan)));
     }
 
     #[test]

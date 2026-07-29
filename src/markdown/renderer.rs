@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::Style,
     text::{Line, Span},
@@ -252,11 +252,10 @@ impl<'styles, 'highlight> Writer<'styles, 'highlight> {
             Tag::Heading { level, .. } => {
                 let style = self.styles.heading(level);
                 self.inline_styles.push(style);
-                self.push_segment(Segment::new(
-                    format!("{} ", "#".repeat(heading_number(level))),
-                    style,
-                    None,
-                ));
+                // The ATX marker is syntax, not display content. Keeping it
+                // made headings such as `### Title` look like unparsed raw
+                // Markdown on terminals with weak italic/bold rendering.
+                self.ensure_current(WrapKind::Words);
             }
             Tag::BlockQuote(_) => {
                 self.blockquotes += 1;
@@ -630,17 +629,6 @@ impl<'styles, 'highlight> Writer<'styles, 'highlight> {
                 wrap: WrapKind::Hard,
             });
         }
-    }
-}
-
-fn heading_number(level: HeadingLevel) -> usize {
-    match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
     }
 }
 
@@ -1194,8 +1182,8 @@ mod tests {
             &MarkdownStyles::default(),
         );
         let lines = strings(&rendered);
-        assert!(lines.iter().any(|line| line == "# H1"));
-        assert!(lines.iter().any(|line| line == "###### H6"));
+        assert!(lines.iter().any(|line| line == "H1"));
+        assert!(lines.iter().any(|line| line == "H6"));
         assert!(lines.iter().any(|line| line == "> quoted text"));
         assert!(lines.iter().any(|line| line.starts_with("────")));
         assert!(lines.iter().any(|line| line == "soft break"));
