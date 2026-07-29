@@ -3,8 +3,8 @@ use std::time::Duration;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -89,15 +89,22 @@ fn render_history(frame: &mut Frame<'_>, app: &App, area: Rect) {
         if is_user_line(line) {
             frame.render_widget(Block::default().style(USER_MESSAGE_STYLE), row);
         }
-        frame.render_widget(Paragraph::new(visual_line(line)), row);
     }
+
+    let mut rendered_lines = Vec::with_capacity(top_padding + visible.len());
+    rendered_lines.extend((0..top_padding).map(|_| Line::default()));
+    rendered_lines.extend(visible.iter().map(visual_line));
+    frame.render_widget(
+        Paragraph::new(Text::from(rendered_lines)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn is_user_line(line: &VisualLine) -> bool {
     matches!(line, VisualLine::UserPadding | VisualLine::UserText { .. })
 }
 
-fn visual_line(line: &VisualLine) -> Line<'_> {
+fn visual_line(line: &VisualLine) -> Line<'static> {
     match line {
         VisualLine::UserPadding => Line::default().style(USER_MESSAGE_STYLE),
         VisualLine::UserText { text, first } => Line::from(vec![
@@ -105,24 +112,32 @@ fn visual_line(line: &VisualLine) -> Line<'_> {
                 if *first { "› " } else { "  " },
                 USER_MESSAGE_STYLE.add_modifier(Modifier::BOLD | Modifier::DIM),
             ),
-            Span::styled(text.as_str(), USER_MESSAGE_STYLE),
+            Span::styled(text.clone(), USER_MESSAGE_STYLE),
         ]),
-        VisualLine::AssistantText { text, first } => Line::from(vec![
-            Span::styled(
-                if *first { "• " } else { "  " },
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-            Span::raw(text.as_str()),
-        ]),
-        VisualLine::SystemText { text, first } => Line::from(vec![
-            Span::styled(
-                if *first { "• " } else { "  " },
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            ),
-            Span::styled(text.as_str(), Style::default().add_modifier(Modifier::DIM)),
-        ]),
+        VisualLine::AssistantText { line, first } => {
+            let mut rendered = line.clone();
+            rendered.spans.insert(
+                0,
+                Span::styled(
+                    if *first { "• " } else { "  " },
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            );
+            rendered
+        }
+        VisualLine::SystemText { line, first } => {
+            let base = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::DIM);
+            let mut rendered = line.clone();
+            for span in &mut rendered.spans {
+                span.style = base.patch(span.style);
+            }
+            rendered
+                .spans
+                .insert(0, Span::styled(if *first { "• " } else { "  " }, base));
+            rendered
+        }
         VisualLine::MessageState(state) => match state {
             MessageState::Complete => Line::default(),
             MessageState::Streaming => Line::default(),
