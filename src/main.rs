@@ -4,6 +4,7 @@ mod config;
 mod event;
 mod input;
 mod layout;
+pub mod markdown;
 mod model;
 mod proxy;
 mod scroll;
