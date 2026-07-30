@@ -50,6 +50,7 @@ terminal keyboard enhancement disabled so terminals emit the layout-neutral
 export HTTP_PROXY="http://127.0.0.1:8118"
 export HTTPS_PROXY="http://127.0.0.1:8118"
 export NO_PROXY="localhost,127.0.0.1,::1"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
 export OPENAI_API_KEY="sk-proj-xxxxxxxxx"
 export OPENAI_MODEL="gpt-5.6-terra"
 cargo run
@@ -62,6 +63,7 @@ Set `ALL_PROXY` to route both HTTP and HTTPS requests through SOCKS5:
 ```sh
 export ALL_PROXY="socks5h://127.0.0.1:1080"
 export NO_PROXY="localhost,127.0.0.1,::1"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
 export OPENAI_API_KEY="sk-proj-xxxxxxxxx"
 export OPENAI_MODEL="gpt-5.6-terra"
 cargo run

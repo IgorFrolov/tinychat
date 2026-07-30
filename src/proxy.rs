@@ -1,7 +1,7 @@
 use std::{env, fmt};
 
 use anyhow::{anyhow, Result};
-use reqwest::{ClientBuilder, NoProxy, Proxy};
+use reqwest::{ClientBuilder, NoProxy, Proxy, Url};
 
 #[derive(Clone, Default, Eq, PartialEq)]
 struct ProxySettings {
@@ -48,6 +48,24 @@ pub fn configure_from_env(builder: ClientBuilder) -> Result<ClientBuilder> {
     configure(builder, &ProxySettings::from_env())
 }
 
+pub fn configured_source_for_url(endpoint: &str) -> Option<&'static str> {
+    let url = Url::parse(endpoint).ok()?;
+    proxy_source_from_lookup(url.scheme(), |name| env::var(name).ok())
+}
+
+fn proxy_source_from_lookup(
+    scheme: &str,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Option<&'static str> {
+    let protocol_names = match scheme {
+        "http" => &["HTTP_PROXY", "http_proxy"][..],
+        "https" => &["HTTPS_PROXY", "https_proxy"][..],
+        _ => return None,
+    };
+    first_non_empty_name(&mut lookup, protocol_names)
+        .or_else(|| first_non_empty_name(&mut lookup, &["ALL_PROXY", "all_proxy"]))
+}
+
 fn configure(mut builder: ClientBuilder, settings: &ProxySettings) -> Result<ClientBuilder> {
     if settings.is_empty() {
         return Ok(builder);
@@ -85,6 +103,16 @@ fn first_non_empty(
 
 fn first_set(lookup: &mut impl FnMut(&str) -> Option<String>, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| lookup(name))
+}
+
+fn first_non_empty_name(
+    lookup: &mut impl FnMut(&str) -> Option<String>,
+    names: &[&'static str],
+) -> Option<&'static str> {
+    names
+        .iter()
+        .copied()
+        .find(|name| lookup(name).is_some_and(|value| !value.trim().is_empty()))
 }
 
 #[cfg(test)]
@@ -155,6 +183,25 @@ mod tests {
             ("http_proxy", "http://lower:8000"),
         ]);
         assert_eq!(parsed.http.as_deref(), Some("http://upper:8000"));
+    }
+
+    #[test]
+    fn reports_the_proxy_source_selected_for_the_url_scheme() {
+        let values = HashMap::from([
+            ("ALL_PROXY", "socks5h://127.0.0.1:1080"),
+            ("HTTPS_PROXY", "http://127.0.0.1:8118"),
+        ]);
+        let source =
+            proxy_source_from_lookup("https", |name| values.get(name).map(ToString::to_string));
+        assert_eq!(source, Some("HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn reports_all_proxy_when_no_protocol_proxy_is_set() {
+        let values = HashMap::from([("ALL_PROXY", "socks5h://127.0.0.1:1080")]);
+        let source =
+            proxy_source_from_lookup("https", |name| values.get(name).map(ToString::to_string));
+        assert_eq!(source, Some("ALL_PROXY"));
     }
 
     #[test]
