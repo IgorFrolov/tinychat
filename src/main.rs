@@ -30,6 +30,7 @@ use ratatui::{backend::CrosstermBackend, Terminal, TerminalOptions, Viewport};
 use tokio::{sync::mpsc, task::JoinHandle, time};
 
 const INLINE_VIEWPORT_HEIGHT: u16 = 12;
+const API_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -116,23 +117,27 @@ async fn main() -> Result<()> {
 
 async fn run(terminal: &mut TerminalGuard, mut app: App, api_client: ApiClient) -> Result<()> {
     let mut terminal_events = EventStream::new();
-    let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+    let (api_tx, mut api_rx) = mpsc::channel(API_EVENT_CHANNEL_CAPACITY);
     let mut tick = time::interval(time::Duration::from_millis(200));
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut network_task: Option<JoinHandle<()>> = None;
+    let mut render_pending = true;
 
     insert_welcome_banner(terminal, app.selected_model())?;
 
     loop {
-        flush_stable_transcript(terminal, &mut app)?;
-        let area = terminal.terminal.get_frame().area();
-        app.refresh_history_layout(usize::from(area.width));
-        terminal.set_cursor_visible(
-            !app.model_selector_open
-                && area.width >= ui::MIN_WIDTH
-                && area.height >= ui::MIN_HEIGHT,
-        )?;
-        terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+        if render_pending {
+            flush_stable_transcript(terminal, &mut app)?;
+            let area = terminal.terminal.get_frame().area();
+            app.refresh_history_layout(usize::from(area.width));
+            terminal.set_cursor_visible(
+                !app.model_selector_open
+                    && area.width >= ui::MIN_WIDTH
+                    && area.height >= ui::MIN_HEIGHT,
+            )?;
+            terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+            render_pending = false;
+        }
 
         tokio::select! {
             event = terminal_events.next() => {
@@ -153,6 +158,7 @@ async fn run(terminal: &mut TerminalGuard, mut app: App, api_client: ApiClient) 
                                 client.run(request, cancellation, sender).await;
                             }));
                         }
+                        render_pending = true;
                     }
                     Some(Err(error)) => return Err(error).context("terminal event error"),
                     None => {
@@ -164,11 +170,16 @@ async fn run(terminal: &mut TerminalGuard, mut app: App, api_client: ApiClient) 
                 match event {
                     Some(event) => {
                         app.handle_api_event(event);
+                        while let Ok(event) = api_rx.try_recv() {
+                            app.handle_api_event(event);
+                        }
                     }
                     None => return Err(anyhow::anyhow!("API event channel closed")),
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                render_pending = true;
+            }
         }
 
         if network_task.as_ref().is_some_and(JoinHandle::is_finished) {

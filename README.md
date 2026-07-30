@@ -72,3 +72,9 @@ Both `socks5://` and `socks5h://` URLs are supported, including
 should also be performed through the proxy. `HTTP_PROXY` and `HTTPS_PROXY`
 override `ALL_PROXY` for their respective protocols; lowercase variable names
 are supported too.
+
+## Streaming safety limits
+
+Responses from OpenAI-compatible servers are treated as untrusted input. The API event queue is bounded and terminal rendering is rate-limited
+while streaming to prevent a fast or malformed server from exhausting memory
+or CPU.
