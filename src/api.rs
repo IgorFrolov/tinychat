@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use futures_util::{StreamExt, TryStreamExt};
-use reqwest::{header, Client, Response, StatusCode};
+use reqwest::{header, Client, Response, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -29,6 +29,8 @@ pub struct ApiClient {
     temperature: f32,
     max_tokens: u32,
     timeout: Duration,
+    proxy_source: Option<&'static str>,
+    endpoint_authority: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -328,17 +330,22 @@ fn parse_stream_payload(data: &str) -> Result<ParsedPayload, StreamError> {
 
 impl ApiClient {
     pub fn new(config: &AppConfig) -> anyhow::Result<Self> {
+        let endpoint = config.chat_completions_url();
+        let proxy_source = proxy::configured_source_for_url(&endpoint);
+        let endpoint_authority = endpoint_authority(&endpoint);
         let builder = Client::builder()
             .connect_timeout(Duration::from_secs(15).min(config.timeout))
             .user_agent(format!("tinychat/{}", env!("CARGO_PKG_VERSION")));
         let client = proxy::configure_from_env(builder)?.build()?;
         Ok(Self {
             client,
-            endpoint: config.chat_completions_url(),
+            endpoint,
             api_key: config.api_key.clone(),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
             timeout: config.timeout,
+            proxy_source,
+            endpoint_authority,
         })
     }
 
@@ -379,7 +386,11 @@ impl ApiClient {
                             &events,
                             ApiEvent::Failed {
                                 request_id,
-                                message: safe_request_error(&error),
+                                message: safe_request_error(
+                                    &error,
+                                    self.endpoint_authority.as_deref(),
+                                    self.proxy_source,
+                                ),
                             },
                             &cancellation,
                         )
@@ -487,7 +498,7 @@ async fn stream_response(
                     &events,
                     ApiEvent::Failed {
                         request_id,
-                        message: safe_request_error(&error),
+                        message: safe_request_error(&error, None, None),
                     },
                     &cancellation,
                 )
@@ -729,11 +740,15 @@ fn status_reason(status: StatusCode) -> String {
         .to_owned()
 }
 
-fn safe_request_error(error: &reqwest::Error) -> String {
+fn safe_request_error(
+    error: &reqwest::Error,
+    endpoint_authority: Option<&str>,
+    proxy_source: Option<&str>,
+) -> String {
     if error.is_timeout() {
         "request timed out".to_owned()
     } else if error.is_connect() {
-        "connection failed".to_owned()
+        connection_failed_message(endpoint_authority, proxy_source)
     } else if error.is_decode() {
         "invalid response".to_owned()
     } else if error.is_body() {
@@ -741,6 +756,29 @@ fn safe_request_error(error: &reqwest::Error) -> String {
     } else {
         "request failed".to_owned()
     }
+}
+
+fn endpoint_authority(endpoint: &str) -> Option<String> {
+    let url = Url::parse(endpoint).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn connection_failed_message(
+    endpoint_authority: Option<&str>,
+    proxy_source: Option<&str>,
+) -> String {
+    let mut message = match endpoint_authority {
+        Some(authority) => format!("connection failed to {authority}"),
+        None => "connection failed".to_owned(),
+    };
+    if let Some(source) = proxy_source {
+        message.push_str(&format!("; {source} is configured (check NO_PROXY)"));
+    }
+    message
 }
 
 fn sanitize_text(value: &str) -> String {
@@ -890,6 +928,18 @@ mod tests {
             Some("Invalid API key".into())
         );
         assert_eq!(extract_api_error_message(b"<html>no</html>"), None);
+    }
+
+    #[test]
+    fn connection_error_identifies_destination_and_proxy_without_credentials() {
+        assert_eq!(
+            endpoint_authority("https://user:secret@example.com:8443/v1/chat/completions"),
+            Some("example.com:8443".into())
+        );
+        assert_eq!(
+            connection_failed_message(Some("example.com:8443"), Some("ALL_PROXY")),
+            "connection failed to example.com:8443; ALL_PROXY is configured (check NO_PROXY)"
+        );
     }
 
     #[test]
