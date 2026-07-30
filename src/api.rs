@@ -16,6 +16,10 @@ use crate::{
 
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
 const MAX_ERROR_MESSAGE_CHARS: usize = 240;
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_STREAM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAM_TEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SSE_BLOCKS: usize = 32 * 1024;
 
 #[derive(Clone)]
 pub struct ApiClient {
@@ -115,6 +119,14 @@ pub enum StreamError {
     InvalidUtf8,
     #[error("invalid JSON in SSE event")]
     InvalidJson,
+    #[error("SSE event exceeds the 1 MiB limit")]
+    EventTooLarge,
+    #[error("stream response exceeds the 16 MiB limit")]
+    ResponseTooLarge,
+    #[error("stream text exceeds the 8 MiB limit")]
+    TextTooLarge,
+    #[error("stream exceeds the 32768 SSE block limit")]
+    TooManyBlocks,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -126,20 +138,41 @@ pub enum SseEvent {
 #[derive(Default)]
 pub struct SseDecoder {
     buffer: Vec<u8>,
+    search_offset: usize,
+    blocks_seen: usize,
 }
 
 impl SseDecoder {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, StreamError> {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
+        let mut consumed = 0;
+        let mut search_from = self.search_offset.min(self.buffer.len());
 
-        while let Some((separator_index, separator_len)) = find_event_separator(&self.buffer) {
-            let raw = self.buffer.drain(..separator_index).collect::<Vec<_>>();
-            self.buffer.drain(..separator_len);
-            if let Some(event) = parse_sse_block(&raw)? {
+        while let Some((separator_index, separator_len)) =
+            find_event_separator(&self.buffer[search_from..])
+        {
+            let event_end = search_from + separator_index;
+            if event_end.saturating_sub(consumed) > MAX_SSE_EVENT_BYTES {
+                return Err(StreamError::EventTooLarge);
+            }
+            self.record_block()?;
+            if let Some(event) = parse_sse_block(&self.buffer[consumed..event_end])? {
                 events.push(event);
             }
+            consumed = event_end + separator_len;
+            search_from = consumed;
         }
+
+        if self.buffer.len().saturating_sub(consumed) > MAX_SSE_EVENT_BYTES {
+            return Err(StreamError::EventTooLarge);
+        }
+        if consumed > 0 {
+            self.buffer.drain(..consumed);
+        }
+        // A separator can straddle two chunks. CRLF needs at most the final
+        // three bytes to be checked again after the next append.
+        self.search_offset = self.buffer.len().saturating_sub(3);
 
         Ok(events)
     }
@@ -148,21 +181,78 @@ impl SseDecoder {
         if self.buffer.is_empty() {
             return Ok(Vec::new());
         }
+        if self.buffer.len() > MAX_SSE_EVENT_BYTES {
+            return Err(StreamError::EventTooLarge);
+        }
+        self.record_block()?;
         let raw = std::mem::take(&mut self.buffer);
+        self.search_offset = 0;
         Ok(parse_sse_block(&raw)?.into_iter().collect())
+    }
+
+    fn record_block(&mut self) -> Result<(), StreamError> {
+        self.blocks_seen = checked_total(
+            self.blocks_seen,
+            1,
+            MAX_SSE_BLOCKS,
+            StreamError::TooManyBlocks,
+        )?;
+        Ok(())
     }
 }
 
-fn find_event_separator(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(left), Some(right)) if left <= right => Some((left, 2)),
-        (Some(_), Some(right)) => Some((right, 4)),
-        (Some(index), None) => Some((index, 2)),
-        (None, Some(index)) => Some((index, 4)),
-        (None, None) => None,
+#[derive(Default)]
+struct StreamBudget {
+    response_bytes: usize,
+    text_bytes: usize,
+}
+
+impl StreamBudget {
+    fn record_response_bytes(&mut self, bytes: usize) -> Result<(), StreamError> {
+        self.response_bytes = checked_total(
+            self.response_bytes,
+            bytes,
+            MAX_STREAM_RESPONSE_BYTES,
+            StreamError::ResponseTooLarge,
+        )?;
+        Ok(())
     }
+
+    fn record_text_bytes(&mut self, bytes: usize) -> Result<(), StreamError> {
+        self.text_bytes = checked_total(
+            self.text_bytes,
+            bytes,
+            MAX_STREAM_TEXT_BYTES,
+            StreamError::TextTooLarge,
+        )?;
+        Ok(())
+    }
+}
+
+fn checked_total(
+    current: usize,
+    added: usize,
+    limit: usize,
+    error: StreamError,
+) -> Result<usize, StreamError> {
+    current
+        .checked_add(added)
+        .filter(|total| *total <= limit)
+        .ok_or(error)
+}
+
+fn find_event_separator(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < buffer.len() {
+        if buffer[index..].starts_with(b"\n\n") {
+            return Some((index, 2));
+        }
+        if buffer[index..].starts_with(b"\r\n\r\n") {
+            return Some((index, 4));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn parse_sse_block(raw: &[u8]) -> Result<Option<SseEvent>, StreamError> {
@@ -256,10 +346,10 @@ impl ApiClient {
         &self,
         request: ApiRequest,
         cancellation: CancellationToken,
-        events: mpsc::UnboundedSender<ApiEvent>,
+        events: mpsc::Sender<ApiEvent>,
     ) {
         let request_id = request.id;
-        if events.send(ApiEvent::Started { request_id }).is_err() {
+        if events.send(ApiEvent::Started { request_id }).await.is_err() {
             return;
         }
 
@@ -278,17 +368,22 @@ impl ApiClient {
 
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
-                send_event(&events, ApiEvent::Cancelled { request_id });
+                let _ = events.try_send(ApiEvent::Cancelled { request_id });
                 return;
             }
             result = builder.send() => {
                 match result {
                     Ok(response) => response,
                     Err(error) => {
-                        send_event(&events, ApiEvent::Failed {
-                            request_id,
-                            message: safe_request_error(&error),
-                        });
+                        send_stream_event(
+                            &events,
+                            ApiEvent::Failed {
+                                request_id,
+                                message: safe_request_error(&error),
+                            },
+                            &cancellation,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -298,15 +393,17 @@ impl ApiClient {
         if !response.status().is_success() {
             let message = read_http_error(response, cancellation.clone(), &self.api_key).await;
             if cancellation.is_cancelled() {
-                send_event(&events, ApiEvent::Cancelled { request_id });
+                let _ = events.try_send(ApiEvent::Cancelled { request_id });
             } else {
-                send_event(
+                send_stream_event(
                     &events,
                     ApiEvent::Failed {
                         request_id,
                         message,
                     },
-                );
+                    &cancellation,
+                )
+                .await;
             }
             return;
         }
@@ -319,59 +416,82 @@ async fn stream_response(
     response: Response,
     request_id: u64,
     cancellation: CancellationToken,
-    events: mpsc::UnboundedSender<ApiEvent>,
+    events: mpsc::Sender<ApiEvent>,
 ) {
     let mut stream = response.bytes_stream();
     let mut decoder = SseDecoder::default();
+    let mut budget = StreamBudget::default();
     let mut saw_valid_event = false;
     let mut saw_text = false;
 
     loop {
         let item = tokio::select! {
             _ = cancellation.cancelled() => {
-                send_event(&events, ApiEvent::Cancelled { request_id });
+                let _ = events.try_send(ApiEvent::Cancelled { request_id });
                 return;
             }
             item = stream.next() => item,
         };
 
         match item {
-            Some(Ok(bytes)) => match decoder.push(&bytes) {
-                Ok(decoded) => {
-                    match handle_sse_events(
-                        decoded,
-                        request_id,
-                        &events,
-                        &mut saw_valid_event,
-                        &mut saw_text,
-                    ) {
-                        EventOutcome::Continue => {}
-                        EventOutcome::Done => {
-                            finish_stream(request_id, saw_text, &events);
-                            return;
-                        }
-                        EventOutcome::Failed => return,
-                    }
-                }
-                Err(error) => {
-                    send_event(
+            Some(Ok(bytes)) => {
+                if let Err(error) = budget.record_response_bytes(bytes.len()) {
+                    send_stream_event(
                         &events,
                         ApiEvent::Failed {
                             request_id,
                             message: error.to_string(),
                         },
-                    );
+                        &cancellation,
+                    )
+                    .await;
                     return;
                 }
-            },
+                match decoder.push(&bytes) {
+                    Ok(decoded) => {
+                        match handle_sse_events(
+                            decoded,
+                            request_id,
+                            &events,
+                            &mut saw_valid_event,
+                            &mut saw_text,
+                            &mut budget,
+                            &cancellation,
+                        )
+                        .await
+                        {
+                            EventOutcome::Continue => {}
+                            EventOutcome::Done => {
+                                finish_stream(request_id, saw_text, &events, &cancellation).await;
+                                return;
+                            }
+                            EventOutcome::Failed => return,
+                        }
+                    }
+                    Err(error) => {
+                        send_stream_event(
+                            &events,
+                            ApiEvent::Failed {
+                                request_id,
+                                message: error.to_string(),
+                            },
+                            &cancellation,
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
             Some(Err(error)) => {
-                send_event(
+                send_stream_event(
                     &events,
                     ApiEvent::Failed {
                         request_id,
                         message: safe_request_error(&error),
                     },
-                );
+                    &cancellation,
+                )
+                .await;
                 return;
             }
             None => break,
@@ -386,92 +506,137 @@ async fn stream_response(
                 &events,
                 &mut saw_valid_event,
                 &mut saw_text,
-            ) {
+                &mut budget,
+                &cancellation,
+            )
+            .await
+            {
                 EventOutcome::Continue => {}
                 EventOutcome::Done => {
-                    finish_stream(request_id, saw_text, &events);
+                    finish_stream(request_id, saw_text, &events, &cancellation).await;
                     return;
                 }
                 EventOutcome::Failed => return,
             }
         }
         Err(error) => {
-            send_event(
+            send_stream_event(
                 &events,
                 ApiEvent::Failed {
                     request_id,
                     message: error.to_string(),
                 },
-            );
+                &cancellation,
+            )
+            .await;
             return;
         }
     }
 
     if saw_valid_event {
-        finish_stream(request_id, saw_text, &events);
+        finish_stream(request_id, saw_text, &events, &cancellation).await;
     } else {
-        send_event(
+        send_stream_event(
             &events,
             ApiEvent::Failed {
                 request_id,
                 message: "empty response".to_owned(),
             },
-        );
+            &cancellation,
+        )
+        .await;
     }
 }
 
-fn handle_sse_events(
+async fn handle_sse_events(
     decoded: Vec<SseEvent>,
     request_id: u64,
-    events: &mpsc::UnboundedSender<ApiEvent>,
+    events: &mpsc::Sender<ApiEvent>,
     saw_valid_event: &mut bool,
     saw_text: &mut bool,
+    budget: &mut StreamBudget,
+    cancellation: &CancellationToken,
 ) -> EventOutcome {
+    let mut delta_batch = String::new();
+    let mut latest_usage = None;
+    let mut failure = None;
+    let mut done = false;
+
     for event in decoded {
         match event {
             SseEvent::Done => {
                 *saw_valid_event = true;
-                return EventOutcome::Done;
+                done = true;
+                break;
             }
             SseEvent::Data(data) => match parse_stream_payload(&data) {
                 Ok(parsed) => {
                     *saw_valid_event = true;
                     if let Some(content) = parsed.delta {
+                        if let Err(error) = budget.record_text_bytes(content.len()) {
+                            failure = Some(error.to_string());
+                            break;
+                        }
                         *saw_text = true;
-                        send_event(
-                            events,
-                            ApiEvent::Delta {
-                                request_id,
-                                content,
-                            },
-                        );
+                        delta_batch.push_str(&content);
                     }
                     if let Some(usage) = parsed.usage {
-                        send_event(
-                            events,
-                            ApiEvent::Usage {
-                                request_id,
-                                prompt_tokens: usage.prompt_tokens,
-                                completion_tokens: usage.completion_tokens,
-                                total_tokens: usage.total_tokens,
-                            },
-                        );
+                        latest_usage = Some(usage);
                     }
                 }
                 Err(error) => {
-                    send_event(
-                        events,
-                        ApiEvent::Failed {
-                            request_id,
-                            message: error.to_string(),
-                        },
-                    );
-                    return EventOutcome::Failed;
+                    failure = Some(error.to_string());
+                    break;
                 }
             },
         }
     }
-    EventOutcome::Continue
+
+    if !delta_batch.is_empty()
+        && !send_stream_event(
+            events,
+            ApiEvent::Delta {
+                request_id,
+                content: delta_batch,
+            },
+            cancellation,
+        )
+        .await
+    {
+        return EventOutcome::Failed;
+    }
+    if let Some(usage) = latest_usage {
+        if !send_stream_event(
+            events,
+            ApiEvent::Usage {
+                request_id,
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            },
+            cancellation,
+        )
+        .await
+        {
+            return EventOutcome::Failed;
+        }
+    }
+    if let Some(message) = failure {
+        send_stream_event(
+            events,
+            ApiEvent::Failed {
+                request_id,
+                message,
+            },
+            cancellation,
+        )
+        .await;
+        EventOutcome::Failed
+    } else if done {
+        EventOutcome::Done
+    } else {
+        EventOutcome::Continue
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -481,7 +646,12 @@ enum EventOutcome {
     Failed,
 }
 
-fn finish_stream(request_id: u64, saw_text: bool, events: &mpsc::UnboundedSender<ApiEvent>) {
+async fn finish_stream(
+    request_id: u64,
+    saw_text: bool,
+    events: &mpsc::Sender<ApiEvent>,
+    cancellation: &CancellationToken,
+) {
     let event = if saw_text {
         ApiEvent::Finished { request_id }
     } else {
@@ -490,11 +660,18 @@ fn finish_stream(request_id: u64, saw_text: bool, events: &mpsc::UnboundedSender
             message: "empty response".to_owned(),
         }
     };
-    send_event(events, event);
+    send_stream_event(events, event, cancellation).await;
 }
 
-fn send_event(events: &mpsc::UnboundedSender<ApiEvent>, event: ApiEvent) {
-    let _ = events.send(event);
+async fn send_stream_event(
+    events: &mpsc::Sender<ApiEvent>,
+    event: ApiEvent,
+    cancellation: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        _ = cancellation.cancelled() => false,
+        result = events.send(event) => result.is_ok(),
+    }
 }
 
 async fn read_http_error(
@@ -672,6 +849,32 @@ mod tests {
     }
 
     #[test]
+    fn finds_a_separator_split_across_incremental_scans() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder
+            .push(b"data: [DONE]\r\n\r")
+            .unwrap_or_default()
+            .is_empty());
+        assert!(decoder.search_offset > 0);
+        assert_eq!(
+            decoder.push(b"\n").unwrap_or_default(),
+            vec![SseEvent::Done]
+        );
+    }
+
+    #[test]
+    fn empty_sse_blocks_cannot_bypass_the_stream_event_limit() {
+        let mut decoder = SseDecoder {
+            blocks_seen: MAX_SSE_BLOCKS,
+            ..SseDecoder::default()
+        };
+        assert!(matches!(
+            decoder.push(b"\n\n"),
+            Err(StreamError::TooManyBlocks)
+        ));
+    }
+
+    #[test]
     fn ignores_empty_delta() {
         let parsed =
             parse_stream_payload(r#"{"choices":[{"delta":{"content":""}}]}"#).unwrap_or_default();
@@ -698,10 +901,71 @@ mod tests {
         assert_eq!(events, vec![SseEvent::Data("first\nsecond".into())]);
     }
 
+    #[test]
+    fn rejects_an_oversized_unterminated_event() {
+        let mut decoder = SseDecoder::default();
+        let oversized = vec![b'x'; MAX_SSE_EVENT_BYTES + 1];
+        assert!(matches!(
+            decoder.push(&oversized),
+            Err(StreamError::EventTooLarge)
+        ));
+    }
+
+    #[test]
+    fn rejects_an_oversized_terminated_event() {
+        let mut decoder = SseDecoder::default();
+        let mut oversized = vec![b'x'; MAX_SSE_EVENT_BYTES + 1];
+        oversized.extend_from_slice(b"\n\n");
+        assert!(matches!(
+            decoder.push(&oversized),
+            Err(StreamError::EventTooLarge)
+        ));
+    }
+
+    #[test]
+    fn accepts_multiple_bounded_events_in_a_large_chunk() {
+        let padding = "x".repeat(MAX_SSE_EVENT_BYTES / 2);
+        let event = format!(": {padding}\ndata: [DONE]\n\n");
+        let chunk = event.repeat(3);
+        assert!(chunk.len() > MAX_SSE_EVENT_BYTES);
+
+        let events = decoder_events(chunk.as_bytes());
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| *event == SseEvent::Done));
+    }
+
+    #[test]
+    fn stream_budget_enforces_all_limits_and_overflow() {
+        let mut budget = StreamBudget::default();
+        assert!(budget
+            .record_response_bytes(MAX_STREAM_RESPONSE_BYTES)
+            .is_ok());
+        assert!(matches!(
+            budget.record_response_bytes(1),
+            Err(StreamError::ResponseTooLarge)
+        ));
+
+        let mut budget = StreamBudget::default();
+        assert!(budget.record_text_bytes(MAX_STREAM_TEXT_BYTES).is_ok());
+        assert!(matches!(
+            budget.record_text_bytes(1),
+            Err(StreamError::TextTooLarge)
+        ));
+
+        assert!(matches!(
+            checked_total(usize::MAX, 1, usize::MAX, StreamError::ResponseTooLarge),
+            Err(StreamError::ResponseTooLarge)
+        ));
+    }
+
+    fn decoder_events(chunk: &[u8]) -> Vec<SseEvent> {
+        SseDecoder::default().push(chunk).unwrap_or_default()
+    }
+
     #[tokio::test]
     async fn reports_empty_successful_stream_as_error() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        finish_stream(9, false, &sender);
+        let (sender, mut receiver) = mpsc::channel(1);
+        finish_stream(9, false, &sender, &CancellationToken::new()).await;
         let event = receiver.recv().await;
         assert!(matches!(
             event,
@@ -710,5 +974,53 @@ mod tests {
                 message
             }) if message == "empty response"
         ));
+    }
+
+    #[tokio::test]
+    async fn batches_deltas_before_crossing_the_bounded_channel() {
+        let decoded = vec![
+            SseEvent::Data(r#"{"choices":[{"delta":{"content":"Hello"}}]}"#.into()),
+            SseEvent::Data(r#"{"choices":[{"delta":{"content":" world"}}]}"#.into()),
+        ];
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut saw_valid_event = false;
+        let mut saw_text = false;
+        let outcome = handle_sse_events(
+            decoded,
+            7,
+            &sender,
+            &mut saw_valid_event,
+            &mut saw_text,
+            &mut StreamBudget::default(),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(outcome, EventOutcome::Continue);
+        assert!(saw_valid_event);
+        assert!(saw_text);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ApiEvent::Delta {
+                request_id: 7,
+                content
+            }) if content == "Hello world"
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancellation_unblocks_a_full_event_channel() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .send(ApiEvent::Started { request_id: 1 })
+            .await
+            .expect("test receiver must stay open");
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(
+            !send_stream_event(&sender, ApiEvent::Finished { request_id: 1 }, &cancellation).await
+        );
     }
 }
