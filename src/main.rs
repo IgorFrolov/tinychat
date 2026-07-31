@@ -5,6 +5,7 @@ mod event;
 mod input;
 mod layout;
 pub mod markdown;
+pub mod mascot;
 mod model;
 mod proxy;
 mod qr;
@@ -202,11 +203,11 @@ async fn run(terminal: &mut TerminalGuard, mut app: App, api_client: ApiClient) 
 }
 
 fn insert_welcome_banner(terminal: &mut TerminalGuard, model: &str) -> Result<()> {
+    let width = terminal.terminal.size()?.width;
+    let height = ui::welcome_banner_height(width, model);
     terminal
         .terminal
-        .insert_before(ui::WELCOME_BANNER_HEIGHT, |buffer| {
-            ui::render_welcome_banner(buffer, model)
-        })?;
+        .insert_before(height, |buffer| ui::render_welcome_banner(buffer, model))?;
     Ok(())
 }
 
