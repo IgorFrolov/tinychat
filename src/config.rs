@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const DEFAULT_MODEL: &str = "gpt-4.1-mini";
+const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 120;

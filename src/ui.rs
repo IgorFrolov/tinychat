@@ -5,7 +5,9 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Widget,
+    },
     Frame,
 };
 use unicode_width::UnicodeWidthStr;
@@ -13,12 +15,12 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     app::{App, RequestStatus, UiMetrics},
     layout::VisualLine,
+    mascot::MascotEmotion,
     model::MessageState,
 };
 
 pub const MIN_WIDTH: u16 = 30;
 pub const MIN_HEIGHT: u16 = 8;
-pub const WELCOME_BANNER_HEIGHT: u16 = 5;
 
 const LIVE_PREFIX_COLS: u16 = 2;
 const COMPOSER_PADDING_ROWS: u16 = 2;
@@ -26,6 +28,12 @@ const FOOTER_GAP_ROWS: u16 = 1;
 const SHORTCUT_ROWS: u16 = 5;
 const MIN_HISTORY_HEIGHT: u16 = 2;
 const USER_MESSAGE_STYLE: Style = Style::new().bg(Color::Rgb(38, 38, 38));
+const FULL_WELCOME_BANNER_HEIGHT: u16 = 9;
+const MINIMAL_WELCOME_BANNER_HEIGHT: u16 = 4;
+const WELCOME_HORIZONTAL_PADDING: u16 = 2;
+const WELCOME_BORDER_WIDTH: u16 = 2;
+const WELCOME_MESSAGE: &str = "Welcome to tinychat!";
+const DETAIL_LABEL_WIDTH: usize = 11;
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
@@ -129,39 +137,117 @@ pub fn render_transcript_buffer(buffer: &mut Buffer, lines: &[VisualLine]) {
 }
 
 pub fn render_welcome_banner(buffer: &mut Buffer, model: &str) {
+    let Some(width) = full_welcome_banner_width(buffer.area.width, model) else {
+        render_minimal_welcome_banner(buffer, model);
+        return;
+    };
     let area = Rect::new(
         buffer.area.x,
         buffer.area.y,
-        buffer.area.width.min(64),
-        WELCOME_BANNER_HEIGHT.saturating_sub(1),
+        width,
+        buffer
+            .area
+            .height
+            .min(FULL_WELCOME_BANNER_HEIGHT.saturating_sub(1)),
     );
-    let title = Line::from(vec![
-        Span::styled(">_ ", Style::default().fg(Color::Cyan)),
-        Span::styled(
-            "tinychat",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
     let content = vec![
-        Line::from(Span::styled(
-            "Welcome to tinychat",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("model: ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw(model.to_owned()),
-        ]),
+        Line::default(),
+        welcome_line(MascotEmotion::Neutral.face(), WELCOME_MESSAGE),
+        Line::default(),
+        detail_line("Model:", model),
+        detail_line("Version:", env!("CARGO_PKG_VERSION")),
+        Line::default(),
     ];
     Paragraph::new(content)
         .block(
             Block::default()
-                .title(title)
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .padding(Padding::horizontal(WELCOME_HORIZONTAL_PADDING))
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
         .render(area, buffer);
+}
+
+pub fn welcome_banner_height(terminal_width: u16, model: &str) -> u16 {
+    if full_welcome_banner_width(terminal_width, model).is_some() {
+        FULL_WELCOME_BANNER_HEIGHT
+    } else {
+        MINIMAL_WELCOME_BANNER_HEIGHT
+    }
+}
+
+fn full_welcome_banner_width(terminal_width: u16, model: &str) -> Option<u16> {
+    let welcome_width = UnicodeWidthStr::width(MascotEmotion::Neutral.face())
+        .saturating_add(2)
+        .saturating_add(UnicodeWidthStr::width(WELCOME_MESSAGE));
+    let model_width = DETAIL_LABEL_WIDTH.saturating_add(UnicodeWidthStr::width(model));
+    let version_width =
+        DETAIL_LABEL_WIDTH.saturating_add(UnicodeWidthStr::width(env!("CARGO_PKG_VERSION")));
+    let content_width = welcome_width.max(model_width).max(version_width);
+    let required_width = content_width
+        .saturating_add(usize::from(WELCOME_HORIZONTAL_PADDING) * 2)
+        .saturating_add(usize::from(WELCOME_BORDER_WIDTH));
+    let required_width = u16::try_from(required_width).unwrap_or(u16::MAX);
+
+    if required_width > terminal_width {
+        return None;
+    }
+
+    Some((terminal_width / 3).max(required_width))
+}
+
+fn render_minimal_welcome_banner(buffer: &mut Buffer, model: &str) {
+    let area = Rect::new(
+        buffer.area.x,
+        buffer.area.y,
+        buffer.area.width,
+        buffer.area.height.min(MINIMAL_WELCOME_BANNER_HEIGHT - 1),
+    );
+    Paragraph::new(vec![
+        Line::from(Span::styled(
+            WELCOME_MESSAGE,
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        minimal_detail_line("Model:", model),
+        minimal_detail_line("Version:", env!("CARGO_PKG_VERSION")),
+    ])
+    .render(area, buffer);
+}
+
+fn welcome_line(logo: &'static str, message: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            logo,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {message}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn detail_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<DETAIL_LABEL_WIDTH$}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::raw(value.to_owned()),
+    ])
+}
+
+fn minimal_detail_line(label: &'static str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label} "),
+            Style::default().add_modifier(Modifier::DIM),
+        ),
+        Span::raw(value.to_owned()),
+    ])
 }
 
 fn is_user_line(line: &VisualLine) -> bool {
@@ -280,7 +366,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         vec![Line::from(vec![
             prefix,
             Span::styled(
-                "Ask anything or use /qr <text>",
+                "Ask anything",
                 USER_MESSAGE_STYLE.add_modifier(Modifier::DIM),
             ),
         ])]
@@ -740,13 +826,47 @@ mod tests {
 
     #[test]
     fn welcome_banner_contains_product_and_model() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, WELCOME_BANNER_HEIGHT));
+        let height = welcome_banner_height(80, "gpt-4.1-mini");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, height));
         render_welcome_banner(&mut buffer, "gpt-4.1-mini");
         let rows = buffer_rows(&buffer);
 
-        assert!(rows.iter().any(|row| row.contains(">_ tinychat")));
-        assert!(rows.iter().any(|row| row.contains("Welcome to tinychat")));
-        assert!(rows.iter().any(|row| row.contains("model: gpt-4.1-mini")));
+        assert!(rows.iter().any(|row| row.contains("Welcome to tinychat!")));
+        assert!(rows.iter().any(|row| row.contains("│  (0_0)")));
+        assert!(rows.iter().all(|row| !row.contains("Press ?")));
+        assert!(rows.iter().all(|row| !row.contains("Directory:")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("Model:     gpt-4.1-mini")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains(concat!("Version:   ", env!("CARGO_PKG_VERSION")))));
+        assert!(rows.first().is_some_and(|row| row.starts_with('╭')));
+        assert!(rows.get(7).is_some_and(|row| row.starts_with('╰')));
+    }
+
+    #[test]
+    fn welcome_banner_uses_one_third_or_the_required_content_width() {
+        assert_eq!(full_welcome_banner_width(120, "gpt-4.1-mini"), Some(40));
+        assert_eq!(full_welcome_banner_width(80, "gpt-4.1-mini"), Some(33));
+    }
+
+    #[test]
+    fn welcome_banner_falls_back_to_minimal_text_when_it_cannot_fit() {
+        let model = "a-model-name-that-is-wider-than-the-terminal";
+        let height = welcome_banner_height(30, model);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 30, height));
+        render_welcome_banner(&mut buffer, model);
+        let rows = buffer_rows(&buffer);
+
+        assert_eq!(height, MINIMAL_WELCOME_BANNER_HEIGHT);
+        assert!(rows.iter().any(|row| row.starts_with(WELCOME_MESSAGE)));
+        assert!(rows.iter().any(|row| row.starts_with("Model: ")));
+        assert!(rows.iter().any(|row| row.starts_with("Version: ")));
+        assert!(rows
+            .iter()
+            .all(|row| !row.contains(MascotEmotion::Neutral.face())));
+        assert!(rows.iter().all(|row| !row.contains('╭')));
     }
 
     #[test]
