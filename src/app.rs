@@ -9,7 +9,8 @@ use crate::{
     event::ApiEvent,
     input::InputState,
     layout::HistoryLayout,
-    model::{messages_for_request, Message, MessageState, Role, TokenUsage},
+    model::{messages_for_request, Message, MessageKind, MessageState, Role, TokenUsage},
+    qr,
 };
 
 const QUIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -320,7 +321,7 @@ impl App {
                 self.leave_history_navigation();
                 self.input.insert_newline();
             }
-            KeyCode::Enter if !control => return self.start_request(),
+            KeyCode::Enter if !control => return self.start_request(metrics.input_width),
             KeyCode::Left
                 if key
                     .modifiers
@@ -412,7 +413,7 @@ impl App {
         }
     }
 
-    fn start_request(&mut self) -> Option<(ApiRequest, CancellationToken)> {
+    fn start_request(&mut self, available_width: usize) -> Option<(ApiRequest, CancellationToken)> {
         if self.active_request.is_some() || self.input.text().trim().is_empty() {
             return None;
         }
@@ -424,12 +425,18 @@ impl App {
         self.input_history_index = None;
         self.input_history_draft.clear();
 
+        if let Some(payload) = qr_payload(&text).map(str::to_owned) {
+            self.run_qr_command(text, &payload, available_width);
+            return None;
+        }
+
         let user_message_id = self.take_message_id();
         self.messages.push(Message {
             id: user_message_id,
             role: Role::User,
             content: text,
             state: MessageState::Complete,
+            kind: MessageKind::Chat,
         });
         let assistant_message_id = self.take_message_id();
         self.messages.push(Message {
@@ -437,6 +444,7 @@ impl App {
             role: Role::Assistant,
             content: String::new(),
             state: MessageState::Streaming,
+            kind: MessageKind::Chat,
         });
         self.history_layout.invalidate();
 
@@ -460,6 +468,55 @@ impl App {
             messages: messages_for_request(&self.messages, &self.config.system_prompt),
         };
         Some((request, cancellation))
+    }
+
+    fn run_qr_command(&mut self, command: String, payload: &str, available_width: usize) {
+        let user_message_id = self.take_message_id();
+        self.messages.push(Message {
+            id: user_message_id,
+            role: Role::User,
+            content: command,
+            state: MessageState::Complete,
+            kind: MessageKind::Local,
+        });
+
+        let (content, kind) = if payload.is_empty() {
+            ("Usage: `/qr <text or URL>`".to_owned(), MessageKind::Local)
+        } else {
+            match qr::render(payload) {
+                Ok(lines) => {
+                    let required_width = lines.first().map_or(0, |line| line.chars().count());
+                    if required_width > available_width {
+                        (
+                            format!(
+                                "QR code needs {required_width} columns. Widen the terminal to at least {} columns and try again.",
+                                required_width.saturating_add(3)
+                            ),
+                            MessageKind::Local,
+                        )
+                    } else {
+                        (lines.join("\n"), MessageKind::Qr)
+                    }
+                }
+                Err(_) => (
+                    "Could not generate QR code: the payload is too long.".to_owned(),
+                    MessageKind::Local,
+                ),
+            }
+        };
+
+        let assistant_message_id = self.take_message_id();
+        self.messages.push(Message {
+            id: assistant_message_id,
+            role: Role::Assistant,
+            content,
+            state: MessageState::Complete,
+            kind,
+        });
+        self.history_layout.invalidate();
+        self.request_status = RequestStatus::Completed;
+        self.received_chunks = 0;
+        self.usage = None;
     }
 
     fn take_message_id(&mut self) -> u64 {
@@ -550,6 +607,11 @@ fn normalize_paste(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
+fn qr_payload(text: &str) -> Option<&str> {
+    let mut parts = text.trim().splitn(2, char::is_whitespace);
+    (parts.next() == Some("/qr")).then(|| parts.next().unwrap_or("").trim())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +687,52 @@ mod tests {
         app.input.move_left();
         app.handle_terminal_event(Event::Paste("b\r\nline\rnext".into()), UiMetrics::default());
         assert_eq!(app.input.text(), "ab\nline\nnextc");
+    }
+
+    #[test]
+    fn qr_command_generates_locally_without_starting_api_request() {
+        let mut app = test_app();
+        app.input.set_text("/qr https://example.com".into());
+
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let request = app.handle_key(submit, UiMetrics { input_width: 80 });
+
+        assert!(request.is_none());
+        assert!(app.active_request.is_none());
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].kind, MessageKind::Local);
+        assert_eq!(app.messages[1].kind, MessageKind::Qr);
+        assert!(app.messages[1].content.contains('█'));
+        assert!(messages_for_request(&app.messages, "").is_empty());
+    }
+
+    #[test]
+    fn qr_command_explains_missing_payload_and_required_width() {
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        let mut missing = test_app();
+        missing.input.set_text("/qr".into());
+        assert!(missing
+            .handle_key(submit, UiMetrics { input_width: 80 })
+            .is_none());
+        assert_eq!(missing.messages[1].kind, MessageKind::Local);
+        assert!(missing.messages[1].content.contains("/qr <text or URL>"));
+
+        let mut narrow = test_app();
+        narrow.input.set_text("/qr hello".into());
+        assert!(narrow
+            .handle_key(submit, UiMetrics { input_width: 10 })
+            .is_none());
+        assert_eq!(narrow.messages[1].kind, MessageKind::Local);
+        assert!(narrow.messages[1].content.contains("needs 29 columns"));
+    }
+
+    #[test]
+    fn qr_prefix_only_matches_a_complete_command_name() {
+        assert_eq!(qr_payload("/qr hello"), Some("hello"));
+        assert_eq!(qr_payload(" /qr   hello world "), Some("hello world"));
+        assert_eq!(qr_payload("/qr"), Some(""));
+        assert_eq!(qr_payload("/qrcode hello"), None);
     }
 
     #[test]

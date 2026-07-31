@@ -202,6 +202,16 @@ fn visual_line(line: &VisualLine) -> Line<'static> {
                 .insert(0, Span::styled(if *first { "• " } else { "  " }, base));
             rendered
         }
+        VisualLine::QrText { text, first } => Line::from(vec![
+            Span::styled(
+                if *first { "• " } else { "  " },
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                text.clone(),
+                Style::default().fg(Color::Black).bg(Color::White),
+            ),
+        ]),
         VisualLine::MessageState(state) => match state {
             MessageState::Complete => Line::default(),
             MessageState::Streaming => Line::default(),
@@ -270,7 +280,7 @@ fn render_composer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         vec![Line::from(vec![
             prefix,
             Span::styled(
-                "Ask anything",
+                "Ask anything or use /qr <text>",
                 USER_MESSAGE_STYLE.add_modifier(Modifier::DIM),
             ),
         ])]
@@ -535,7 +545,7 @@ mod tests {
     use super::*;
     use crate::{
         config::AppConfig,
-        model::{Message, Role},
+        model::{Message, MessageKind, Role},
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal, TerminalOptions, Viewport};
@@ -559,12 +569,14 @@ mod tests {
                 role: Role::User,
                 content: "hello".into(),
                 state: MessageState::Complete,
+                kind: MessageKind::Chat,
             },
             Message {
                 id: 2,
                 role: Role::Assistant,
                 content: "hi there".into(),
                 state: MessageState::Complete,
+                kind: MessageKind::Chat,
             },
         ];
         app.refresh_history_layout(60);
@@ -596,6 +608,7 @@ mod tests {
             role: Role::Assistant,
             content: "### Заголовок".into(),
             state: MessageState::Complete,
+            kind: MessageKind::Chat,
         }];
         app.refresh_history_layout(60);
 
@@ -630,6 +643,7 @@ mod tests {
             )
             .into(),
             state: MessageState::Complete,
+            kind: MessageKind::Chat,
         }];
 
         for (width, height) in [(60, 20), (34, 10), (80, 15)] {
@@ -689,6 +703,7 @@ mod tests {
             role: Role::User,
             content: "kept in terminal scrollback".into(),
             state: MessageState::Complete,
+            kind: MessageKind::Chat,
         }];
         app.refresh_history_layout(60);
         let committed_lines = app.history_layout.lines.clone();

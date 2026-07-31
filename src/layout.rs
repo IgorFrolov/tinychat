@@ -7,7 +7,7 @@ use crate::{
     markdown::{
         Hyperlink, MarkdownRenderMode, MarkdownStyles, RenderedMarkdown, StreamingMarkdown,
     },
-    model::{Message, MessageState, Role},
+    model::{Message, MessageKind, MessageState, Role},
 };
 
 #[derive(Clone, Debug)]
@@ -16,6 +16,7 @@ pub enum VisualLine {
     UserText { text: String, first: bool },
     AssistantText { line: Line<'static>, first: bool },
     SystemText { line: Line<'static>, first: bool },
+    QrText { text: String, first: bool },
     MessageState(MessageState),
     Blank,
 }
@@ -155,7 +156,9 @@ impl HistoryLayout {
                 continue;
             }
 
-            if message.role == Role::User {
+            if message.kind == MessageKind::Qr {
+                self.push_qr_message(message);
+            } else if message.role == Role::User {
                 self.push_user_message(message, width);
             } else {
                 self.push_markdown_message(message, width);
@@ -170,6 +173,15 @@ impl HistoryLayout {
             if !matches!(self.lines.last(), Some(VisualLine::Blank)) {
                 self.lines.push(VisualLine::Blank);
             }
+        }
+    }
+
+    fn push_qr_message(&mut self, message: &Message) {
+        for (index, text) in message.content.lines().enumerate() {
+            self.lines.push(VisualLine::QrText {
+                text: text.to_owned(),
+                first: index == 0,
+            });
         }
     }
 
@@ -252,12 +264,14 @@ mod tests {
                 role: Role::User,
                 content: "hello".into(),
                 state: MessageState::Complete,
+                kind: MessageKind::Chat,
             },
             Message {
                 id: 2,
                 role: Role::Assistant,
                 content: "**hi** there".into(),
                 state: MessageState::Complete,
+                kind: MessageKind::Chat,
             },
         ];
         let mut layout = HistoryLayout::default();
@@ -282,6 +296,7 @@ mod tests {
             role: Role::Assistant,
             content: "same **text**".into(),
             state: MessageState::Streaming,
+            kind: MessageKind::Chat,
         }];
         let mut layout = HistoryLayout::default();
         layout.refresh(&messages, 40);
@@ -299,6 +314,7 @@ mod tests {
             role: Role::Assistant,
             content: "original".into(),
             state: MessageState::Streaming,
+            kind: MessageKind::Chat,
         }];
         let mut layout = HistoryLayout::default();
         layout.refresh(&messages, 40);
@@ -318,6 +334,7 @@ mod tests {
             role: Role::Assistant,
             content: "[site](https://example.com)".into(),
             state: MessageState::Complete,
+            kind: MessageKind::Chat,
         }];
         let mut layout = HistoryLayout::default();
         layout.refresh(&messages, 40);
@@ -333,6 +350,7 @@ mod tests {
             role: Role::Assistant,
             content: "**text**".into(),
             state: MessageState::Complete,
+            kind: MessageKind::Chat,
         }];
         let mut layout = HistoryLayout::default();
         layout.refresh(&messages, 40);
@@ -350,5 +368,27 @@ mod tests {
             other => panic!("expected assistant text, got {other:?}"),
         };
         assert_eq!(rendered, "**text**");
+    }
+
+    #[test]
+    fn keeps_qr_rows_verbatim_without_markdown_wrapping() {
+        let messages = vec![Message {
+            id: 8,
+            role: Role::Assistant,
+            content: " ▀█ \n ▄█ ".into(),
+            state: MessageState::Complete,
+            kind: MessageKind::Qr,
+        }];
+        let mut layout = HistoryLayout::default();
+        layout.refresh(&messages, 3);
+
+        assert!(matches!(
+            &layout.lines[0],
+            VisualLine::QrText { text, first: true } if text == " ▀█ "
+        ));
+        assert!(matches!(
+            &layout.lines[1],
+            VisualLine::QrText { text, first: false } if text == " ▄█ "
+        ));
     }
 }

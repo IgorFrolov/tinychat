@@ -7,6 +7,7 @@ mod layout;
 pub mod markdown;
 mod model;
 mod proxy;
+mod qr;
 mod ui;
 
 use std::{
