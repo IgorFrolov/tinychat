@@ -48,6 +48,26 @@ pub struct TokenUsage {
     pub total_tokens: Option<u64>,
 }
 
+impl TokenUsage {
+    pub fn total(&self) -> Option<u64> {
+        self.total_tokens
+            .or_else(|| Some(self.prompt_tokens?.saturating_add(self.completion_tokens?)))
+    }
+
+    pub fn accumulate(&mut self, usage: &Self) {
+        self.prompt_tokens = add_optional(self.prompt_tokens, usage.prompt_tokens);
+        self.completion_tokens = add_optional(self.completion_tokens, usage.completion_tokens);
+        self.total_tokens = add_optional(self.total_tokens, usage.total());
+    }
+}
+
+fn add_optional(current: Option<u64>, added: Option<u64>) -> Option<u64> {
+    match (current, added) {
+        (None, None) => None,
+        (current, added) => Some(current.unwrap_or(0).saturating_add(added.unwrap_or(0))),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 pub struct RequestMessage {
     pub role: &'static str,

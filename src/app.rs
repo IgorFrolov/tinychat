@@ -10,7 +10,7 @@ use crate::{
     input::InputState,
     layout::HistoryLayout,
     model::{messages_for_request, Message, MessageKind, MessageState, Role, TokenUsage},
-    qr,
+    pricing, qr,
 };
 
 const QUIT_CONFIRMATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,6 +32,7 @@ pub struct ActiveRequest {
     pub cancellation: CancellationToken,
     pub assistant_message_id: u64,
     pub chunks_received: u64,
+    pub model: String,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -59,6 +60,9 @@ pub struct App {
     pub next_request_id: u64,
     pub received_chunks: u64,
     pub usage: Option<TokenUsage>,
+    pub session_started_at: Instant,
+    pub session_usage: TokenUsage,
+    pub session_cost_nano_usd: Option<u128>,
     quit_requested_at: Option<Instant>,
     pub should_quit: bool,
     pub config: AppConfig,
@@ -91,6 +95,9 @@ impl App {
             next_request_id: 1,
             received_chunks: 0,
             usage: None,
+            session_started_at: Instant::now(),
+            session_usage: TokenUsage::default(),
+            session_cost_nano_usd: Some(0),
             quit_requested_at: None,
             should_quit: false,
             config,
@@ -108,6 +115,10 @@ impl App {
         self.active_request
             .as_ref()
             .map(|request| request.started_at.elapsed())
+    }
+
+    pub fn session_elapsed(&self) -> Duration {
+        self.session_started_at.elapsed()
     }
 
     pub fn quit_confirmation_active(&self) -> bool {
@@ -178,16 +189,19 @@ impl App {
             }
             ApiEvent::Finished { .. } => {
                 self.finish_message(MessageState::Complete);
+                self.commit_request_usage();
                 self.active_request = None;
                 self.request_status = RequestStatus::Completed;
             }
             ApiEvent::Cancelled { .. } => {
                 self.finish_message(MessageState::Cancelled);
+                self.commit_request_usage();
                 self.active_request = None;
                 self.request_status = RequestStatus::Cancelled;
             }
             ApiEvent::Failed { message, .. } => {
                 self.finish_message(MessageState::Failed);
+                self.commit_request_usage();
                 self.active_request = None;
                 self.request_status = RequestStatus::Failed(message);
             }
@@ -214,6 +228,7 @@ impl App {
         let Some(active) = self.active_request.take() else {
             return;
         };
+        self.commit_usage_for_model(&active.model);
         active.cancellation.cancel();
         if let Some(message) = self
             .messages
@@ -457,6 +472,7 @@ impl App {
             cancellation: cancellation.clone(),
             assistant_message_id,
             chunks_received: 0,
+            model: self.selected_model().to_owned(),
         });
         self.request_status = RequestStatus::Connecting;
         self.received_chunks = 0;
@@ -552,6 +568,30 @@ impl App {
         self.shortcuts_open = false;
         self.received_chunks = 0;
         self.usage = None;
+        self.session_started_at = Instant::now();
+        self.session_usage = TokenUsage::default();
+        self.session_cost_nano_usd = Some(0);
+    }
+
+    fn commit_request_usage(&mut self) {
+        let Some(model) = self
+            .active_request
+            .as_ref()
+            .map(|request| request.model.clone())
+        else {
+            return;
+        };
+        self.commit_usage_for_model(&model);
+    }
+
+    fn commit_usage_for_model(&mut self, model: &str) {
+        let Some(usage) = self.usage.as_ref() else {
+            return;
+        };
+        self.session_usage.accumulate(usage);
+        self.session_cost_nano_usd = self.session_cost_nano_usd.and_then(|cost| {
+            pricing::estimate_cost_nano_usd(model, usage).map(|added| cost.saturating_add(added))
+        });
     }
 
     fn history_previous(&mut self) {
@@ -760,6 +800,30 @@ mod tests {
         app.mark_transcript_committed(2);
         app.refresh_history_layout(40);
         assert!(app.history_layout.lines.is_empty());
+    }
+
+    #[test]
+    fn completed_requests_accumulate_session_usage_and_cost() {
+        let mut app = test_app();
+        app.input.set_text("hello".into());
+        let submit = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.handle_key(submit, UiMetrics::default()).is_some());
+        let request_id = app.active_request.as_ref().expect("active request").id;
+
+        app.handle_api_event(ApiEvent::Usage {
+            request_id,
+            prompt_tokens: Some(1_000),
+            completion_tokens: Some(100),
+            total_tokens: Some(1_100),
+        });
+        app.handle_api_event(ApiEvent::Finished { request_id });
+
+        assert_eq!(app.session_usage.total(), Some(1_100));
+        assert_eq!(app.session_cost_nano_usd, Some(560_000));
+
+        app.clear_session();
+        assert_eq!(app.session_usage, TokenUsage::default());
+        assert_eq!(app.session_cost_nano_usd, Some(0));
     }
 
     #[test]

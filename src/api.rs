@@ -51,6 +51,12 @@ struct ChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_completion_tokens: Option<u32>,
     stream: bool,
+    stream_options: StreamOptions,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +118,9 @@ fn chat_request<'a>(
         max_tokens: (!profile.modern_token_limit).then_some(max_tokens),
         max_completion_tokens: profile.modern_token_limit.then_some(max_tokens),
         stream: true,
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
     }
 }
 
@@ -812,6 +821,7 @@ mod tests {
             assert!(request.get("max_tokens").is_none(), "{model}");
             assert!(request.get("temperature").is_none(), "{model}");
             assert_eq!(request["messages"][0]["role"], "developer", "{model}");
+            assert_eq!(request["stream_options"]["include_usage"], true, "{model}");
         }
     }
 
