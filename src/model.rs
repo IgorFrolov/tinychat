@@ -25,12 +25,20 @@ pub enum MessageState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageKind {
+    Chat,
+    Local,
+    Qr,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Message {
     pub id: u64,
     pub role: Role,
     pub content: String,
     pub state: MessageState,
+    pub kind: MessageKind,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -61,7 +69,8 @@ pub fn messages_for_request(messages: &[Message], system_prompt: &str) -> Vec<Re
         messages
             .iter()
             .filter(|message| {
-                !message.content.trim().is_empty()
+                message.kind == MessageKind::Chat
+                    && !message.content.trim().is_empty()
                     && match message.role {
                         Role::User => true,
                         Role::Assistant | Role::System => message.state == MessageState::Complete,
@@ -88,30 +97,49 @@ mod tests {
                 role: Role::User,
                 content: "hello".into(),
                 state: MessageState::Complete,
+                kind: MessageKind::Chat,
             },
             Message {
                 id: 2,
                 role: Role::Assistant,
                 content: "complete".into(),
                 state: MessageState::Complete,
+                kind: MessageKind::Chat,
             },
             Message {
                 id: 3,
                 role: Role::Assistant,
                 content: "partial".into(),
                 state: MessageState::Cancelled,
+                kind: MessageKind::Chat,
             },
             Message {
                 id: 4,
                 role: Role::Assistant,
                 content: "local error".into(),
                 state: MessageState::Failed,
+                kind: MessageKind::Chat,
             },
             Message {
                 id: 5,
                 role: Role::Assistant,
                 content: String::new(),
                 state: MessageState::Streaming,
+                kind: MessageKind::Chat,
+            },
+            Message {
+                id: 6,
+                role: Role::User,
+                content: "/qr secret".into(),
+                state: MessageState::Complete,
+                kind: MessageKind::Local,
+            },
+            Message {
+                id: 7,
+                role: Role::Assistant,
+                content: "QR pixels".into(),
+                state: MessageState::Complete,
+                kind: MessageKind::Qr,
             },
         ];
 

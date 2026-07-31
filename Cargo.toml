@@ -15,6 +15,7 @@ idna_adapter = "=1.0.0"
 indexmap = "=2.7.1"
 instability = "=0.3.1"
 pulldown-cmark = "=0.12.2"
+qrcode = { version = "=0.14.1", default-features = false }
 ratatui = "=0.29.0"
 reqwest = { version = "=0.12.28", default-features = false, features = ["json", "rustls-tls", "socks", "stream"] }
 serde = { version = "=1.0.217", features = ["derive"] }
