@@ -455,17 +455,66 @@ fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    frame.render_widget(
-        Paragraph::new(app.selected_model().to_owned())
-            .alignment(Alignment::Right)
-            .style(Style::default().add_modifier(Modifier::DIM)),
-        Rect::new(
-            area.x,
-            area.y,
-            area.width.saturating_sub(2),
-            area.height.min(1),
-        ),
+    let line = Rect::new(
+        area.x.saturating_add(2),
+        area.y,
+        area.width.saturating_sub(4),
+        area.height.min(1),
     );
+    let model = app.selected_model();
+    let model_width = u16::try_from(UnicodeWidthStr::width(model))
+        .unwrap_or(u16::MAX)
+        .min(line.width);
+    frame.render_widget(
+        Paragraph::new(model.to_owned()).style(Style::default().add_modifier(Modifier::DIM)),
+        Rect::new(line.x, line.y, model_width, line.height),
+    );
+
+    let status_x = line.x.saturating_add(model_width).saturating_add(2);
+    let status_area = Rect::new(
+        status_x,
+        line.y,
+        line.right().saturating_sub(status_x),
+        line.height,
+    );
+    let session_status = format_session_status(app);
+    if !status_area.is_empty() {
+        frame.render_widget(
+            Paragraph::new(session_status)
+                .alignment(Alignment::Right)
+                .style(Style::default().add_modifier(Modifier::DIM)),
+            status_area,
+        );
+    }
+}
+
+fn format_session_status(app: &App) -> String {
+    let mut parts = vec![format_elapsed_compact(app.session_elapsed())];
+    if let Some(total) = app.session_usage.total() {
+        parts.push(format!("{total} tokens"));
+        if let Some(cost) = app.session_cost_nano_usd {
+            parts.push(format_estimated_cost(cost));
+        }
+    }
+    parts.join(" · ")
+}
+
+fn format_estimated_cost(nano_usd: u128) -> String {
+    const ONE_DOLLAR: f64 = 1_000_000_000.0;
+    if nano_usd == 0 {
+        return "~$0".to_owned();
+    }
+    if nano_usd < 100_000 {
+        return "<$0.0001".to_owned();
+    }
+    let dollars = nano_usd as f64 / ONE_DOLLAR;
+    if nano_usd < 10_000_000 {
+        format!("~${dollars:.4}")
+    } else if nano_usd < 1_000_000_000 {
+        format!("~${dollars:.3}")
+    } else {
+        format!("~${dollars:.2}")
+    }
 }
 
 fn shortcut_lines(app: &App) -> Vec<Line<'static>> {
@@ -631,7 +680,7 @@ mod tests {
     use super::*;
     use crate::{
         config::AppConfig,
-        model::{Message, MessageKind, Role},
+        model::{Message, MessageKind, Role, TokenUsage},
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, buffer::Buffer, Terminal, TerminalOptions, Viewport};
@@ -684,6 +733,40 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("› Ask anything")));
         assert!(rows.iter().all(|row| !row.contains("for shortcuts")));
         assert!(rows.iter().any(|row| row.contains("gpt-4.1-mini")));
+    }
+
+    #[test]
+    fn footer_shows_minimal_total_token_usage() {
+        let mut app = test_app();
+        let usage = TokenUsage {
+            prompt_tokens: Some(120),
+            completion_tokens: Some(34),
+            total_tokens: None,
+        };
+        app.session_usage.accumulate(&usage);
+        app.session_cost_nano_usd =
+            crate::pricing::estimate_cost_nano_usd(app.selected_model(), &usage);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).expect("terminal");
+        terminal.draw(|frame| render(frame, &app)).expect("render");
+        let rows = buffer_rows(terminal.backend().buffer());
+
+        let footer = rows
+            .iter()
+            .find(|row| row.contains("154 tokens"))
+            .expect("token usage footer");
+        assert!(footer.contains("~$0.0001"));
+        let model = footer.find("gpt-4.1-mini").expect("footer model");
+        let usage = footer.find("154 tokens").expect("footer usage");
+        assert!(model < usage);
+    }
+
+    #[test]
+    fn estimated_cost_format_stays_compact() {
+        assert_eq!(format_estimated_cost(1), "<$0.0001");
+        assert_eq!(format_estimated_cost(1_600_000), "~$0.0016");
+        assert_eq!(format_estimated_cost(125_000_000), "~$0.125");
+        assert_eq!(format_estimated_cost(1_250_000_000), "~$1.25");
     }
 
     #[test]

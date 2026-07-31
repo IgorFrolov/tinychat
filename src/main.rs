@@ -7,6 +7,7 @@ mod layout;
 pub mod markdown;
 pub mod mascot;
 mod model;
+mod pricing;
 mod proxy;
 mod qr;
 mod ui;
