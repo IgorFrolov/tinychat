@@ -7,7 +7,7 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-5.6-luna";
 const DEFAULT_TEMPERATURE: f32 = 0.7;
 const DEFAULT_MAX_TOKENS: u32 = 4096;
-const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_TIMEOUT_SECONDS: u64 = 1200;
 
 pub const SUPPORTED_OPENAI_MODELS: [&str; 10] = [
     "gpt-5.6-sol",
